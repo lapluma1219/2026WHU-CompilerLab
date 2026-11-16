@@ -1346,6 +1346,408 @@ class FunctionCompiler {
     dest.insts.insert(place, std::move(inst));
   }
 
+  bool lookup_const(int vreg, int32_t& value) {
+    if (get_const(vreg, value)) {
+      return true;
+    }
+    const Inst* def = def_inst(vreg);
+    if (def && !def->dead && def->op == Op::Li) {
+      value = def->imm;
+      return true;
+    }
+    return false;
+  }
+
+  // 把 i = i0; while (i < bound) { acc = acc + c; i = i + 1; } 收成乘加。
+  // 只处理步长为 1、初值是非负常数、循环体没有调用/break、而且中间加法不溢出 int32 行程的情况。
+  void close_counted_loops() {
+    // 一次只收一个循环，收完重建支配，避免后面的循环用到过期的前驱。
+    for (;;) {
+    rebuild_cfg();
+    compute_dom();
+    index_defs();
+    const int n = static_cast<int>(blocks_.size());
+    bool closed_one = false;
+    for (int header = 0; header < n && !closed_one; ++header) {
+      Inst* branch = terminator(header);
+      if (!branch || branch->op != Op::Br) {
+        continue;
+      }
+      const int latch = branch->true_bb;
+      const int exit_bb = branch->false_bb;
+      // 出口通常仍被循环头支配，因为它只能从头上的分支到达。不能据此把循环判掉。
+      if (latch < 0 || exit_bb < 0 || latch == header || !dominates(header, latch)) {
+        continue;
+      }
+      const Inst* compare = nullptr;
+      for (const Inst& inst : blocks_[static_cast<std::size_t>(header)].insts) {
+        if (inst.dead || is_term(inst.op)) {
+          continue;
+        }
+        if (resolve(inst.dst) == resolve(branch->a) && inst.op == Op::Slt) {
+          compare = &inst;
+        } else {
+          compare = nullptr;
+          break;
+        }
+      }
+      if (!compare) {
+        continue;
+      }
+      std::vector<int> latches;
+      int preheader = -1;
+      bool bad_pred = false;
+      for (int pred : blocks_[static_cast<std::size_t>(header)].preds) {
+        if (dominates(header, pred)) {
+          latches.push_back(pred);
+        } else if (preheader < 0) {
+          preheader = pred;
+        } else {
+          bad_pred = true;
+        }
+      }
+      if (bad_pred || preheader < 0 || latches.size() != 1 || latches[0] != latch) {
+        continue;
+      }
+      Inst* back = terminator(latch);
+      if (!back || back->op != Op::Jmp || back->true_bb != header) {
+        continue;
+      }
+      int iv_phi = -1;
+      int32_t iv_init = 0;
+      bool iv_ok = false;
+      struct Acc {
+        int phi = -1;
+        int init = -1;
+        int extra = -1;
+        int32_t imm = 0;
+        bool imm_only = false;
+      };
+      std::vector<Acc> accs;
+      bool shape_ok = true;
+      for (int phi_index : blocks_[static_cast<std::size_t>(header)].phis) {
+        Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
+        if (phi.dead) {
+          continue;
+        }
+        if (phi.incoming.size() != 2) {
+          shape_ok = false;
+          break;
+        }
+        int init_v = -1;
+        int next_v = -1;
+        for (const auto& incoming : phi.incoming) {
+          if (incoming.first == latch) {
+            next_v = resolve(incoming.second);
+          } else if (incoming.first == preheader) {
+            init_v = resolve(incoming.second);
+          }
+        }
+        if (init_v < 0 || next_v < 0) {
+          shape_ok = false;
+          break;
+        }
+        const Inst* update = def_inst(next_v);
+        if (!update || update->dead) {
+          shape_ok = false;
+          break;
+        }
+        const int phi_dst = resolve(phi.dst);
+        if (update->op == Op::Addi && resolve(update->a) == phi_dst && update->imm == 1 &&
+            resolve(compare->a) == phi_dst) {
+          int32_t init_c = 0;
+          if (!lookup_const(init_v, init_c) || init_c < 0) {
+            shape_ok = false;
+            break;
+          }
+          iv_phi = phi_dst;
+          iv_init = init_c;
+          iv_ok = true;
+          continue;
+        }
+        if ((update->op == Op::Addi || update->op == Op::Add) &&
+            (resolve(update->a) == phi_dst || resolve(update->b) == phi_dst)) {
+          Acc acc;
+          acc.phi = phi_dst;
+          acc.init = init_v;
+          if (update->op == Op::Addi && resolve(update->a) == phi_dst) {
+            acc.imm_only = true;
+            acc.imm = update->imm;
+          } else if (update->op == Op::Add) {
+            const int other = resolve(update->a) == phi_dst ? resolve(update->b) : resolve(update->a);
+            int32_t other_c = 0;
+            if (lookup_const(other, other_c)) {
+              acc.imm_only = true;
+              acc.imm = other_c;
+            } else {
+              const int other_block = other >= 0 && other < static_cast<int>(def_block_.size())
+                                           ? def_block_[static_cast<std::size_t>(other)]
+                                           : header;
+              if (other_block == header || other_block == latch || dominates(header, other_block)) {
+                shape_ok = false;
+                break;
+              }
+              acc.extra = other;
+            }
+          } else {
+            shape_ok = false;
+            break;
+          }
+          accs.push_back(acc);
+          continue;
+        }
+        shape_ok = false;
+        break;
+      }
+      if (!shape_ok || !iv_ok) {
+        continue;
+      }
+      bool extra_inst = false;
+      for (const Inst& inst : blocks_[static_cast<std::size_t>(latch)].insts) {
+        if (inst.dead || is_term(inst.op)) {
+          continue;
+        }
+        bool explained = false;
+        for (int phi_index : blocks_[static_cast<std::size_t>(header)].phis) {
+          const Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
+          if (phi.dead) {
+            continue;
+          }
+          for (const auto& incoming : phi.incoming) {
+            if (incoming.first == latch && resolve(incoming.second) == resolve(inst.dst)) {
+              explained = true;
+            }
+          }
+        }
+        if (!explained) {
+          extra_inst = true;
+        }
+      }
+      if (extra_inst) {
+        continue;
+      }
+      const int bound = resolve(compare->b);
+      if (bound < 0) {
+        continue;
+      }
+      const int bound_block = bound < static_cast<int>(def_block_.size())
+                                  ? def_block_[static_cast<std::size_t>(bound)]
+                                  : header;
+      if (bound_block == header || bound_block == latch || dominates(header, bound_block)) {
+        continue;
+      }
+      if (!terminator(preheader) || terminator(preheader)->op != Op::Jmp) {
+        continue;
+      }
+      // 循环里算出来、又在循环外被用到的值，只能是归纳变量和累加量。
+      // 指令用必须在循环头支配的块里；phi 用必须来自头本身或头支配的前驱。
+      std::unordered_set<int> exported;
+      exported.insert(iv_phi);
+      for (const Acc& acc : accs) {
+        exported.insert(acc.phi);
+      }
+      auto defined_in_loop = [&](int vreg) {
+        vreg = resolve(vreg);
+        if (vreg < 0 || vreg >= static_cast<int>(def_block_.size())) {
+          return false;
+        }
+        const int block = def_block_[static_cast<std::size_t>(vreg)];
+        return block == header || block == latch;
+      };
+      bool use_ok = true;
+      for (int block = 0; block < n && use_ok; ++block) {
+        if (block == header || block == latch) {
+          continue;
+        }
+        for (const Inst& inst : blocks_[static_cast<std::size_t>(block)].insts) {
+          if (inst.dead) {
+            continue;
+          }
+          auto check_use = [&](int slot) {
+            const int cur = resolve(slot);
+            if (!defined_in_loop(cur)) {
+              return;
+            }
+            if (!exported.count(cur) || !dominates(header, block)) {
+              use_ok = false;
+            }
+          };
+          check_use(inst.a);
+          check_use(inst.b);
+          for (int arg : inst.args) {
+            check_use(arg);
+          }
+        }
+        for (int phi_index : blocks_[static_cast<std::size_t>(block)].phis) {
+          const Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
+          if (phi.dead) {
+            continue;
+          }
+          for (const auto& incoming : phi.incoming) {
+            const int cur = resolve(incoming.second);
+            if (!defined_in_loop(cur)) {
+              continue;
+            }
+            const bool edge_from_loop = incoming.first == header || dominates(header, incoming.first);
+            if (!exported.count(cur) || !edge_from_loop) {
+              use_ok = false;
+            }
+          }
+        }
+      }
+      if (!use_ok) {
+        continue;
+      }
+      const int init_li = new_vreg();
+      Inst init_inst;
+      init_inst.op = Op::Li;
+      init_inst.dst = init_li;
+      init_inst.imm = iv_init;
+      insert_before_term(preheader, init_inst);
+      const int enter = new_block();
+      const int skip = new_block();
+      const int join = new_block();
+      const int cmp_dst = new_vreg();
+      Inst cmp;
+      cmp.op = Op::Slt;
+      cmp.dst = cmp_dst;
+      cmp.a = init_li;
+      cmp.b = bound;
+      insert_before_term(preheader, cmp);
+      Inst* pre_term = terminator(preheader);
+      pre_term->op = Op::Br;
+      pre_term->a = cmp_dst;
+      pre_term->true_bb = enter;
+      pre_term->false_bb = skip;
+      auto emit_in = [&](int block, Inst inst) {
+        blocks_[static_cast<std::size_t>(block)].insts.push_back(std::move(inst));
+      };
+      const int trip = new_vreg();
+      Inst trip_sub;
+      trip_sub.op = Op::Sub;
+      trip_sub.dst = trip;
+      trip_sub.a = bound;
+      trip_sub.b = init_li;
+      emit_in(enter, trip_sub);
+      std::vector<std::pair<int, int>> finals;
+      finals.push_back({iv_phi, -1});
+      const int iv_final = new_vreg();
+      Inst iv_add;
+      iv_add.op = Op::Add;
+      iv_add.dst = iv_final;
+      iv_add.a = init_li;
+      iv_add.b = trip;
+      emit_in(enter, iv_add);
+      finals.back().second = iv_final;
+      for (const Acc& acc : accs) {
+        const int prod = new_vreg();
+        if (acc.imm_only) {
+          Inst scale;
+          scale.op = Op::Li;
+          scale.dst = new_vreg();
+          scale.imm = acc.imm;
+          emit_in(enter, scale);
+          Inst mul;
+          mul.op = Op::Mul;
+          mul.dst = prod;
+          mul.a = trip;
+          mul.b = scale.dst;
+          emit_in(enter, mul);
+        } else {
+          Inst mul;
+          mul.op = Op::Mul;
+          mul.dst = prod;
+          mul.a = trip;
+          mul.b = acc.extra;
+          emit_in(enter, mul);
+        }
+        const int sum = new_vreg();
+        Inst add;
+        add.op = Op::Add;
+        add.dst = sum;
+        add.a = acc.init;
+        add.b = prod;
+        emit_in(enter, add);
+        finals.push_back({acc.phi, sum});
+      }
+      Inst jmp_join;
+      jmp_join.op = Op::Jmp;
+      jmp_join.true_bb = join;
+      emit_in(enter, jmp_join);
+      std::vector<std::pair<int, int>> skip_vals;
+      skip_vals.push_back({iv_phi, init_li});
+      for (const Acc& acc : accs) {
+        skip_vals.push_back({acc.phi, acc.init});
+      }
+      Inst jmp_skip;
+      jmp_skip.op = Op::Jmp;
+      jmp_skip.true_bb = join;
+      emit_in(skip, jmp_skip);
+      std::unordered_map<int, int> closed;
+      for (std::size_t i = 0; i < finals.size(); ++i) {
+        Phi phi;
+        phi.dst = new_vreg();
+        phi.block = join;
+        phi.var = -1;
+        phi.incoming.push_back({enter, finals[i].second});
+        phi.incoming.push_back({skip, skip_vals[i].second});
+        closed[finals[i].first] = phi.dst;
+        blocks_[static_cast<std::size_t>(join)].phis.push_back(static_cast<int>(phis_.size()));
+        phis_.push_back(phi);
+      }
+      Inst jmp_exit;
+      jmp_exit.op = Op::Jmp;
+      jmp_exit.true_bb = exit_bb;
+      emit_in(join, jmp_exit);
+      auto rewrite_slot = [&](int& slot) {
+        const auto found = closed.find(resolve(slot));
+        if (found != closed.end()) {
+          slot = found->second;
+        }
+      };
+      // 只改循环头支配的块。汇合点上另一条路的指令不能换成这条循环的结果。
+      for (int block = 0; block < static_cast<int>(blocks_.size()); ++block) {
+        if (block == header || block == latch || block == enter || block == skip || block == join) {
+          continue;
+        }
+        if (!dominates(header, block)) {
+          continue;
+        }
+        for (Inst& inst : blocks_[static_cast<std::size_t>(block)].insts) {
+          rewrite_slot(inst.a);
+          rewrite_slot(inst.b);
+          for (int& arg : inst.args) {
+            rewrite_slot(arg);
+          }
+        }
+      }
+      for (Phi& phi : phis_) {
+        if (phi.dead || phi.block == header || phi.block == latch || phi.block == enter ||
+            phi.block == skip || phi.block == join) {
+          continue;
+        }
+        for (auto& incoming : phi.incoming) {
+          rewrite_slot(incoming.second);
+          // 头上的出口边改接到 join，phi 的前驱要跟着改。
+          if (incoming.first == header) {
+            incoming.first = join;
+          }
+        }
+      }
+      // new_block 可能让原来的 branch 指针失效，这里重新取。
+      // 头不再连到出口，死循环留在 latch 上，重建后从入口不可达。
+      Inst* header_term = terminator(header);
+      header_term->op = Op::Jmp;
+      header_term->true_bb = latch;
+      header_term->a = -1;
+      closed_one = true;
+    }
+    if (!closed_one) {
+      return;
+    }
+    }
+  }
+
   void eliminate_dead() {
     const int n = static_cast<int>(alias_.size());
     std::vector<uint8_t> vreg_needed(static_cast<std::size_t>(n), 0);
@@ -1461,6 +1863,11 @@ class FunctionCompiler {
     reduce_induction();
     propagate_constants();
     strength_reduce_ops();
+    rebuild_cfg();
+    compute_dom();
+    eliminate_dead();
+    simplify_phis();
+    close_counted_loops();
     rebuild_cfg();
     eliminate_dead();
     simplify_phis();

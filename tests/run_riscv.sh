@@ -385,6 +385,40 @@ run_case unswa "$tmp/unsw2.c" "$tmp/unsw2a.in" "15" 15
 printf '6 9 2\n' > "$tmp/unsw2b.in"
 run_case unswb "$tmp/unsw2.c" "$tmp/unsw2b.in" "6" 6
 
+# 步长为 1、初值非负、循环里只做累加时，-opt 可以收成乘法。结果必须和 -asm 一样。
+cat > "$tmp/closed.c" << 'EOF'
+int main() {
+    int n = getint();
+    int i = 0;
+    int s = 0;
+    while (i < n) {
+        int d = i * i;
+        s = s + 3;
+        i = i + 1;
+    }
+    putint(s);
+    return i;
+}
+EOF
+printf '5\n' > "$tmp/closed5.in"
+run_case closed5 "$tmp/closed.c" "$tmp/closed5.in" "15" 5
+printf '0\n' > "$tmp/closed0.in"
+run_case closed0 "$tmp/closed.c" "$tmp/closed0.in" "0" 0
+cat > "$tmp/closedneg.c" << 'EOF'
+int main() {
+    int n = -4;
+    int i = 0;
+    int s = 7;
+    while (i < n) {
+        s = s + 3;
+        i = i + 1;
+    }
+    putint(s);
+    return i;
+}
+EOF
+run_case closedneg "$tmp/closedneg.c" /dev/null "7" 0
+
 rm -rf "$tmp"
 if ! python3 tests/fuzz_opt.py ./compiler 11 30; then
   echo "FAIL opt-fuzz"
