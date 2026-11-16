@@ -2,9 +2,10 @@ CXX ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -O2
 CPPFLAGS ?= -Isrc
 
-SRCS := src/main.cpp src/lexer/lexer.cpp src/lexer/token.cpp src/parser/parser.cpp src/sema/sema.cpp
+SRCS := src/main.cpp src/lexer/lexer.cpp src/lexer/token.cpp src/parser/parser.cpp \
+        src/sema/sema.cpp src/codegen/codegen.cpp
 HEADERS := src/lexer/lexer.hpp src/lexer/token.hpp src/common/diagnostic.hpp \
-           src/ast/ast.hpp src/parser/parser.hpp src/sema/sema.hpp
+           src/ast/ast.hpp src/parser/parser.hpp src/sema/sema.hpp src/codegen/codegen.hpp
 
 .PHONY: all clean test
 

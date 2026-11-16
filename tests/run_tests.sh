@@ -86,11 +86,41 @@ set +e
 echo 'int main(){return 0;}' | ./compiler -asm > "$actual" 2> "$err"
 status=$?
 set -e
-if [[ "$status" -eq 0 || -s "$actual" ]]; then
-  echo "FAIL -asm is stage 3 and must not write stdout (exit=$status)"
+if [[ "$status" -ne 0 ]] || ! grep -q '^\.globl main$' "$actual" || ! grep -q $'\tret$' "$actual"; then
+  echo "FAIL -asm should emit RV assembly (exit=$status)"
   fail=$((fail + 1))
 else
-  echo "PASS cli-rejects-asm"
+  echo "PASS cli-asm"
+  pass=$((pass + 1))
+fi
+rm -f "$actual" "$err"
+
+actual="$(mktemp)"
+err="$(mktemp)"
+set +e
+echo 'int main(){return 1;}' | ./compiler -opt -asm > "$actual" 2> "$err"
+status=$?
+set -e
+if [[ "$status" -ne 0 ]] || ! grep -q 'li t0, 1' "$actual"; then
+  echo "FAIL -asm -opt should accept the optimization flag"
+  fail=$((fail + 1))
+else
+  echo "PASS cli-asm-opt"
+  pass=$((pass + 1))
+fi
+rm -f "$actual" "$err"
+
+actual="$(mktemp)"
+err="$(mktemp)"
+set +e
+echo 'int main(){return 0;}' | ./compiler -opt > "$actual" 2> "$err"
+status=$?
+set -e
+if [[ "$status" -eq 0 || -s "$actual" ]]; then
+  echo "FAIL -opt without -asm should fail"
+  fail=$((fail + 1))
+else
+  echo "PASS cli-rejects-opt-alone"
   pass=$((pass + 1))
 fi
 rm -f "$actual" "$err"
@@ -132,6 +162,14 @@ if [[ "$status" -ne 0 ]]; then
 else
   echo "PASS ast-shape"
   pass=$((pass + 1))
+fi
+
+if bash tests/run_riscv.sh; then
+  echo "PASS riscv-qemu"
+  pass=$((pass + 1))
+else
+  echo "FAIL riscv-qemu"
+  fail=$((fail + 1))
 fi
 
 echo "$pass passed, $fail failed"

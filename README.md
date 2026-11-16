@@ -32,7 +32,17 @@ echo "int main() { int a; a = 1; return a; }" | ./compiler -ast > test.check-ast
 ./compiler -ast < test.c > test.check-ast
 ```
 
-程序从标准输入读完整份源程序。一次只接受 `-token` 或 `-ast`。`-asm`、`-opt` 还没有实现，会在 stderr 提示并返回 2，stdout 为空。分析本身无论 `accept` 还是 `reject` 都返回 0。
+程序从标准输入读完整份源程序。一次选择 `-token`、`-ast` 或 `-asm`。`-opt` 只能和 `-asm` 一起用。分析模式无论 `accept` 还是 `reject` 都返回 0。
+
+```bash
+echo "int main() { return 1; }" | ./compiler -asm > test.s
+./compiler -asm -opt < test.c > test.s
+riscv64-linux-gnu-gcc -march=rv64gc -mabi=lp64d -nostdlib -static -no-pie \
+  -Wl,-e,_start test.s tests/runtime/libtoyc.s -o test
+qemu-riscv64 ./test
+```
+
+`-asm` 按现有语法树生成 RV64GC 汇编。整数运算使用 32 位指令。`-opt` 在结果不变的前提下做常量折叠、加乘的简单化简，以及 `return` 之后直线代码的删除。课程评测链接的是自己的 `libtoyc.a`；`tests/runtime/libtoyc.s` 只给本地 QEMU 使用，`putint` 不附加换行。
 
 `-token` 的输出与已经验收的词法阶段相同。`-ast` 在没有错误时只输出 `accept`；有错误时输出 `reject` 和 0-based 行号。它不打印语法树。树在内部建立，语义分析使用它，供后面的代码生成和答辩查看结构。
 

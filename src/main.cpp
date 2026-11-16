@@ -1,3 +1,4 @@
+#include "codegen/codegen.hpp"
 #include "lexer/lexer.hpp"
 #include "parser/parser.hpp"
 #include "sema/sema.hpp"
@@ -55,6 +56,8 @@ void print_ast_result(std::vector<toyc::Diagnostic> diagnostics) {
 int main(int argc, char** argv) {
   bool token_mode = false;
   bool ast_mode = false;
+  bool asm_mode = false;
+  bool optimize = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "-token") {
@@ -65,12 +68,22 @@ int main(int argc, char** argv) {
       ast_mode = true;
       continue;
     }
+    if (arg == "-asm") {
+      asm_mode = true;
+      continue;
+    }
+    if (arg == "-opt") {
+      optimize = true;
+      continue;
+    }
     std::cerr << "unsupported argument: " << arg << '\n';
-    std::cerr << "usage: compiler -token|-ast < input\n";
+    std::cerr << "usage: compiler -token|-ast|-asm [-opt] < input\n";
     return 2;
   }
-  if (token_mode == ast_mode) {
-    std::cerr << "usage: compiler -token|-ast < input\n";
+  const int modes = static_cast<int>(token_mode) + static_cast<int>(ast_mode) +
+                    static_cast<int>(asm_mode);
+  if (modes != 1 || (optimize && !asm_mode)) {
+    std::cerr << "usage: compiler -token|-ast|-asm [-opt] < input\n";
     return 2;
   }
 
@@ -78,6 +91,23 @@ int main(int argc, char** argv) {
   const toyc::LexResult lex = lexer.tokenize();
   if (token_mode) {
     print_result(lex);
+    return 0;
+  }
+  if (asm_mode) {
+    if (!lex.diagnostics.empty()) {
+      std::cerr << "lexical error\n";
+      return 1;
+    }
+    std::vector<toyc::Diagnostic> syntax;
+    toyc::Parser parser(lex.tokens, syntax, lex.eof_line, lex.eof_column);
+    std::unique_ptr<toyc::CompUnit> unit = parser.parse();
+    if (!syntax.empty() || !unit) {
+      std::cerr << "syntax error\n";
+      return 1;
+    }
+    std::vector<toyc::Diagnostic> semantic;
+    toyc::analyze(*unit, semantic);
+    std::cout << toyc::emit_asm(*unit, optimize);
     return 0;
   }
 
