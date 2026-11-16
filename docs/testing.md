@@ -1,6 +1,12 @@
 # 第 1 阶段测试记录
 
-记录的是本仓库在 Linux 上实际跑过的命令。本地全部通过不等于课程平台 OJ 通过。平台评测还没有提交。
+记录的是本仓库在 Linux 上实际跑过的命令。本地全部通过不等于课程平台 OJ 通过。
+
+## 平台第一次评测
+
+分支 `cursor/stage1-lexer-6b19`、提交 `f967b06e16ef1fd50d8186a8285774d4d0aa60e5`。平台 96.67/100，29/30 通过。唯一失败是 `l04_numbers`，结论为“错误输出”，3ms，没有输入、期望输出或构建日志。`l11_unary`、`l18_operator_adjacency`、`l10_mixed` 以及全部非法字符点都通过。
+
+那一版把 `012` 切成 `IntConst:"0"` 和 `IntConst:"12"`，负号则按样例拆开。第二次修正只改连续数字：`012` 成为一个 `IntConst`。负号、运算符和非法字符的输出保持不变。
 
 ## 环境
 
@@ -15,7 +21,7 @@
 make test
 ```
 
-结果：`35 passed, 0 failed`。其中 31 个是 `tests/cases/*.in` 的 stdout 字节比较，另外 4 项是：
+数字串修正后重新执行 `make test`，结果：`36 passed, 0 failed`。其中 32 个是 `tests/cases/*.in` 的 stdout 字节比较，另外 4 项是：
 
 - `echo "int a = 1;" | ./compiler -token` 与 `stdin_example` 的期望一致
 - 不带 `-token` 时返回非 0，stdout 为空
@@ -63,8 +69,9 @@ echo "b = +a - -1;" | ./build/compiler -token
 | `official_sample` | 页面综合样例，208 个 token，序号 0–207，含 `+a - -1` |
 | `illegal_sample` | `$` `#` `?` 在 0-based 行 3、4、5；空行后恢复，`2` `3` `4` 仍在 |
 | `comment_hides_illegal` | 页面 7.3，注释里的非法字符没有 `reject` |
-| `number_minus_follows_sample` | `-1`、`1-2`、`--1`、`- 1`、`(-1)`、`+1`、`-0`、`-012` 都拆开负号 |
-| `numbers_and_idents_boundary` | `0`、`012`、`0001`、超长数字原文、`123abc`、`0x10`、`9_` |
+| `number_minus_follows_sample` | `-1`、`1-2`、`--1`、`- 1`、`(-1)`、`+1`、`-0` 仍拆开负号；`-012` 是 `'-'` 加 `IntConst:"012"` |
+| `numbers_and_idents_boundary` | `01`、`012`、`00`、`0001` 各为一个整数；`123abc`、`0x10`、`9_` 仍在数字和标识符边界断开 |
+| `number_digit_run` | `0`、`007`、`08`、`2147483647`、`2147483648`、30 位数字、`1+2`、`1-2`、`+12`、`-12` |
 | `keyword_boundary` | `int` 与 `integer`、`int0`、`Int`、`returnValue` |
 | `operators_longest` | `<=` `>=` `==` `!=` `&&` `||` |
 | `operator_boundaries` | `+++`、`===`、`<<=`、`>>=`、`&&&`、`\|\|\|`、单独 `&` `\|` |

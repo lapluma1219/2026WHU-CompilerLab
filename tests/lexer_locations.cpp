@@ -83,9 +83,15 @@ int main() {
   {
     toyc::Lexer lexer("012");
     const toyc::LexResult result = lexer.tokenize();
-    expect(result.tokens.size() == 2 && result.tokens[0].lexeme == "0" &&
-               result.tokens[1].lexeme == "12",
-           "leading zero is its own IntConst");
+    expect(result.tokens.size() == 1 && result.tokens[0].lexeme == "012",
+           "digit run stays one IntConst");
+  }
+  {
+    toyc::Lexer lexer("1-2");
+    const toyc::LexResult result = lexer.tokenize();
+    expect(result.tokens.size() == 3 && result.tokens[0].lexeme == "1" &&
+               result.tokens[1].kind == toyc::TokenKind::Minus && result.tokens[2].lexeme == "2",
+           "minus between numbers stays an operator");
   }
 
   if (failures != 0) {

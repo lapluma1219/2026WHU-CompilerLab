@@ -186,17 +186,13 @@ void Lexer::scan_identifier() {
 }
 
 void Lexer::scan_number() {
-  // 只匹配 (0|[1-9][0-9]*)。课程页 NUMBER 正则写了 -?，
-  // 但公布样例把紧挨着的 -1 拆成两个 token，这里不把负号吃进字面量。
+  // 负号不在这里消费：公布样例把 -1 拆开，且平台的一元/相邻运算符测试已通过。
+  // 数字本身取最长连续数字。严格正则会把 012 拆成 0 和 12，平台 l04_numbers 因此失败。
   const int line = line_;
   const int column = column_;
   const std::size_t start = pos_;
-  if (peek() == '0') {
+  while (!eof() && is_digit(static_cast<unsigned char>(peek()))) {
     advance();
-  } else {
-    while (!eof() && is_digit(static_cast<unsigned char>(peek()))) {
-      advance();
-    }
   }
   add_token(TokenKind::IntConst, source_.substr(start, pos_ - start), line, column);
 }
