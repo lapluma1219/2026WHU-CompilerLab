@@ -285,8 +285,9 @@ class FunctionCompiler {
     build();
     optimize();
     eliminate_phis();
-    // 回边改成底部 blt 后，本地 QEMU 上这条紧循环反而更慢，先不旋转。
     fuse_compares();
+    // 头上只剩比较时，把同一条比较放到回边，热路径少一次无条件跳转。
+    sink_loop_branch();
     allocate();
     emit_asm(out);
   }
@@ -2480,6 +2481,44 @@ class FunctionCompiler {
         term->a = dst;
         term->true_bb = true_bb;
         term->false_bb = false_bb;
+      }
+    }
+    rebuild_cfg();
+  }
+
+  void sink_loop_branch() {
+    rebuild_cfg();
+    compute_dom();
+    const int n = static_cast<int>(blocks_.size());
+    for (int header = 0; header < n; ++header) {
+      Inst* branch = terminator(header);
+      if (!branch || branch->op != Op::CBr) {
+        continue;
+      }
+      bool only_branch = true;
+      for (const Inst& inst : blocks_[static_cast<std::size_t>(header)].insts) {
+        if (!inst.dead && !is_term(inst.op)) {
+          only_branch = false;
+        }
+      }
+      if (!only_branch || branch->true_bb < 0 || branch->false_bb < 0) {
+        continue;
+      }
+      for (int pred : blocks_[static_cast<std::size_t>(header)].preds) {
+        if (!dominates(header, pred)) {
+          continue;
+        }
+        Inst* back = terminator(pred);
+        // 只处理单块循环。多块循环把比较挪走后，布局常常要再补一条跳转。
+        if (!back || back->op != Op::Jmp || back->true_bb != header || branch->true_bb != pred) {
+          continue;
+        }
+        back->op = Op::CBr;
+        back->imm = branch->imm;
+        back->a = branch->a;
+        back->b = branch->b;
+        back->true_bb = branch->true_bb;
+        back->false_bb = branch->false_bb;
       }
     }
     rebuild_cfg();
