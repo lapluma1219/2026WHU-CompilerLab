@@ -40,7 +40,8 @@ enum class Op {
   Call,
   Ret,
   Br,
-  Jmp
+  Jmp,
+  CBr
 };
 
 struct Inst {
@@ -116,7 +117,7 @@ int32_t shl32(int32_t lhs, int amount) {
 
 bool fits12(int32_t value) { return value >= -2048 && value <= 2047; }
 
-bool is_term(Op op) { return op == Op::Br || op == Op::Jmp || op == Op::Ret; }
+bool is_term(Op op) { return op == Op::Br || op == Op::Jmp || op == Op::Ret || op == Op::CBr; }
 
 bool expr_side_effect(const Expr& expr) {
   switch (expr.kind) {
@@ -284,6 +285,8 @@ class FunctionCompiler {
     build();
     optimize();
     eliminate_phis();
+    // 回边改成底部 blt 后，本地 QEMU 上这条紧循环反而更慢，先不旋转。
+    fuse_compares();
     allocate();
     emit_asm(out);
   }
@@ -568,7 +571,7 @@ class FunctionCompiler {
       if (term->op == Op::Jmp) {
         add_edge(block, term->true_bb);
         stack.push_back(term->true_bb);
-      } else if (term->op == Op::Br) {
+      } else if (term->op == Op::Br || term->op == Op::CBr) {
         add_edge(block, term->true_bb);
         stack.push_back(term->true_bb);
         if (term->false_bb != term->true_bb) {
@@ -1026,10 +1029,7 @@ class FunctionCompiler {
     if (vreg < 0) {
       return true;
     }
-    int32_t ignored = 0;
-    if (get_const(vreg, ignored)) {
-      return true;
-    }
+    // 常量也要等它的 li 已经在循环外，不能先把用到它的除法提出去。
     if (vreg >= static_cast<int>(def_block_.size())) {
       return false;
     }
@@ -1091,10 +1091,13 @@ class FunctionCompiler {
           if (inst.dead || inst.dst < 0) {
             continue;
           }
-          if (inst.op != Op::Add && inst.op != Op::Sub && inst.op != Op::Mul && inst.op != Op::Addi &&
-              inst.op != Op::Shl && inst.op != Op::Neg && inst.op != Op::Li && inst.op != Op::Slt &&
-              inst.op != Op::Sgt && inst.op != Op::Sle && inst.op != Op::Sge && inst.op != Op::Eq &&
-              inst.op != Op::Ne && inst.op != Op::Seqz && inst.op != Op::Snez) {
+          const bool arithmetic = inst.op == Op::Add || inst.op == Op::Sub || inst.op == Op::Mul ||
+                                   inst.op == Op::Addi || inst.op == Op::Shl || inst.op == Op::Neg ||
+                                   inst.op == Op::Li || inst.op == Op::Slt || inst.op == Op::Sgt ||
+                                   inst.op == Op::Sle || inst.op == Op::Sge || inst.op == Op::Eq ||
+                                   inst.op == Op::Ne || inst.op == Op::Seqz || inst.op == Op::Snez;
+          const bool divrem = inst.op == Op::Div || inst.op == Op::Rem;
+          if (!arithmetic && !divrem) {
             continue;
           }
           if (inst.a >= 0 && !defined_outside(inst.a, loop)) {
@@ -1102,6 +1105,19 @@ class FunctionCompiler {
           }
           if (inst.b >= 0 && !defined_outside(inst.b, loop)) {
             continue;
+          }
+          if (divrem) {
+            int32_t divisor = 0;
+            const bool const_nz = get_const(inst.b, divisor) && divisor != 0;
+            bool every_iter = !latches.empty();
+            for (int latch : latches) {
+              if (!dominates(block, latch)) {
+                every_iter = false;
+              }
+            }
+            if (!const_nz && !every_iter) {
+              continue;
+            }
           }
           Inst moved = inst;
           inst.dead = true;
@@ -1368,7 +1384,8 @@ class FunctionCompiler {
         if (inst.dead) {
           continue;
         }
-        if (inst.op == Op::Call || inst.op == Op::Ret || inst.op == Op::Br || inst.op == Op::Jmp) {
+        if (inst.op == Op::Call || inst.op == Op::Ret || inst.op == Op::Br || inst.op == Op::Jmp ||
+            inst.op == Op::CBr) {
           need_vreg(inst.a);
           need_vreg(inst.b);
           for (int arg : inst.args) {
@@ -1401,7 +1418,8 @@ class FunctionCompiler {
         if (inst.dead) {
           continue;
         }
-        if (inst.op == Op::Call || inst.op == Op::Ret || inst.op == Op::Br || inst.op == Op::Jmp) {
+        if (inst.op == Op::Call || inst.op == Op::Ret || inst.op == Op::Br || inst.op == Op::Jmp ||
+            inst.op == Op::CBr) {
           if (inst.op == Op::Call && inst.dst >= 0 && !vreg_needed[static_cast<std::size_t>(resolve(inst.dst))]) {
             inst.dst = -1;
           }
@@ -1434,7 +1452,12 @@ class FunctionCompiler {
     propagate_constants();
     rebuild_cfg();
     compute_dom();
-    hoist_invariants();
+    for (int pass = 0; pass < 4; ++pass) {
+      reassociate();
+      propagate_constants();
+      strength_reduce_ops();
+      hoist_invariants();
+    }
     reduce_induction();
     propagate_constants();
     strength_reduce_ops();
@@ -1531,7 +1554,7 @@ class FunctionCompiler {
       int home = pred;
       int succ_count = 0;
       if (Inst* term = terminator(pred)) {
-        if (term->op == Op::Br && term->true_bb != term->false_bb) {
+        if ((term->op == Op::Br || term->op == Op::CBr) && term->true_bb != term->false_bb) {
           succ_count = 2;
         } else {
           succ_count = 1;
@@ -1554,6 +1577,294 @@ class FunctionCompiler {
       block.phis.clear();
     }
     rebuild_cfg();
+  }
+
+  static bool is_cmp(Op op) {
+    return op == Op::Slt || op == Op::Sgt || op == Op::Sle || op == Op::Sge || op == Op::Eq ||
+           op == Op::Ne || op == Op::Seqz || op == Op::Snez;
+  }
+
+  static int cmp_code(Op op) {
+    switch (op) {
+      case Op::Slt:
+        return 0;
+      case Op::Sgt:
+        return 1;
+      case Op::Sle:
+        return 2;
+      case Op::Sge:
+        return 3;
+      case Op::Eq:
+        return 4;
+      case Op::Ne:
+        return 5;
+      case Op::Seqz:
+        return 6;
+      case Op::Snez:
+        return 7;
+      default:
+        return -1;
+    }
+  }
+
+  void reassociate() {
+    for (int guard = 0; guard < 32; ++guard) {
+      std::vector<int> uses(alias_.size(), 0);
+      std::vector<std::pair<int, int>> def_at(alias_.size(), {-1, -1});
+      auto touch = [&](int vreg) {
+        vreg = resolve(vreg);
+        if (vreg >= 0 && vreg < static_cast<int>(uses.size())) {
+          ++uses[static_cast<std::size_t>(vreg)];
+        }
+      };
+      for (int block = 0; block < static_cast<int>(blocks_.size()); ++block) {
+        for (int index = 0; index < static_cast<int>(blocks_[static_cast<std::size_t>(block)].insts.size());
+             ++index) {
+          Inst& inst = blocks_[static_cast<std::size_t>(block)].insts[static_cast<std::size_t>(index)];
+          if (inst.dead) {
+            continue;
+          }
+          touch(inst.a);
+          touch(inst.b);
+          for (int arg : inst.args) {
+            touch(arg);
+          }
+          if (inst.dst >= 0) {
+            const int dst = resolve(inst.dst);
+            if (dst >= 0 && dst < static_cast<int>(def_at.size())) {
+              def_at[static_cast<std::size_t>(dst)] = {block, index};
+            }
+          }
+        }
+      }
+      bool folded = false;
+      for (Block& block : blocks_) {
+        for (Inst& inst : block.insts) {
+          if (inst.dead || (inst.op != Op::Add && inst.op != Op::Addi)) {
+            continue;
+          }
+          const int left = resolve(inst.a);
+          const int right = inst.op == Op::Add ? resolve(inst.b) : -1;
+          auto try_fold = [&](int mid, int other, bool other_imm, int32_t other_const) -> bool {
+            if (mid < 0 || mid >= static_cast<int>(uses.size()) || uses[static_cast<std::size_t>(mid)] != 1) {
+              return false;
+            }
+            const auto at = def_at[static_cast<std::size_t>(mid)];
+            if (at.first < 0) {
+              return false;
+            }
+            Inst& src = blocks_[static_cast<std::size_t>(at.first)].insts[static_cast<std::size_t>(at.second)];
+            if (src.dead || (src.op != Op::Add && src.op != Op::Addi) || resolve(src.dst) != mid) {
+              return false;
+            }
+            const int base = resolve(src.a);
+            if (base < 0 || base == inst.dst) {
+              return false;
+            }
+            if (src.op == Op::Addi && other_imm) {
+              const int32_t sum = add32(src.imm, other_const);
+              if (!fits12(sum)) {
+                return false;
+              }
+              inst.op = Op::Addi;
+              inst.a = base;
+              inst.b = -1;
+              inst.imm = sum;
+              src.dead = true;
+              return true;
+            }
+            int extra = src.op == Op::Addi ? -1 : resolve(src.b);
+            int32_t extra_imm = src.op == Op::Addi ? src.imm : 0;
+            const bool extra_is_imm = src.op == Op::Addi;
+            Inst sum_inst;
+            sum_inst.dst = new_vreg();
+            if (extra_is_imm && other_imm) {
+              return false;
+            }
+            if (extra_is_imm && !other_imm) {
+              sum_inst.op = Op::Addi;
+              sum_inst.a = other;
+              sum_inst.imm = extra_imm;
+            } else if (!extra_is_imm && other_imm) {
+              sum_inst.op = Op::Addi;
+              sum_inst.a = extra;
+              sum_inst.imm = other_const;
+            } else {
+              sum_inst.op = Op::Add;
+              sum_inst.a = extra;
+              sum_inst.b = other;
+            }
+            if (!fits12(sum_inst.imm) && sum_inst.op == Op::Addi) {
+              return false;
+            }
+            const int sum_dst = sum_inst.dst;
+            int inst_index = 0;
+            for (int i = 0; i < static_cast<int>(block.insts.size()); ++i) {
+              if (&block.insts[static_cast<std::size_t>(i)] == &inst) {
+                inst_index = i;
+                break;
+              }
+            }
+            const int dest_block = static_cast<int>(&block - blocks_.data());
+            int src_index = at.second;
+            block.insts.insert(block.insts.begin() + inst_index, sum_inst);
+            if (at.first == dest_block && src_index >= inst_index) {
+              ++src_index;
+            }
+            Inst& rewritten = block.insts[static_cast<std::size_t>(inst_index + 1)];
+            rewritten.op = Op::Add;
+            rewritten.a = base;
+            rewritten.b = sum_dst;
+            rewritten.imm = 0;
+            blocks_[static_cast<std::size_t>(at.first)].insts[static_cast<std::size_t>(src_index)].dead = true;
+            return true;
+          };
+          if (inst.op == Op::Addi && try_fold(left, -1, true, inst.imm)) {
+            folded = true;
+            break;
+          }
+          if (inst.op == Op::Add) {
+            int32_t lhs_c = 0;
+            int32_t rhs_c = 0;
+            const bool lhs_imm = get_const(left, lhs_c);
+            const bool rhs_imm = get_const(right, rhs_c);
+            if (try_fold(left, right, rhs_imm, rhs_c) || try_fold(right, left, lhs_imm, lhs_c)) {
+              folded = true;
+              break;
+            }
+          }
+          if (folded) {
+            break;
+          }
+        }
+        if (folded) {
+          break;
+        }
+      }
+      if (!folded) {
+        return;
+      }
+    }
+  }
+
+  void rotate_loops() {
+    compute_dom();
+    const int n = static_cast<int>(blocks_.size());
+    for (int header = 0; header < n; ++header) {
+      Inst* branch = terminator(header);
+      if (!branch || branch->op != Op::Br) {
+        continue;
+      }
+      const int cond = resolve(branch->a);
+      const int true_bb = branch->true_bb;
+      const int false_bb = branch->false_bb;
+      const Inst* compare = nullptr;
+      int others = 0;
+      for (const Inst& inst : blocks_[static_cast<std::size_t>(header)].insts) {
+        if (inst.dead || is_term(inst.op)) {
+          continue;
+        }
+        if (resolve(inst.dst) == cond && is_cmp(inst.op)) {
+          compare = &inst;
+        } else {
+          ++others;
+        }
+      }
+      if (!compare || others != 0) {
+        continue;
+      }
+      std::vector<int> latches;
+      bool simple = true;
+      bool outside = false;
+      for (int pred : blocks_[static_cast<std::size_t>(header)].preds) {
+        if (!dominates(header, pred)) {
+          outside = true;
+          continue;
+        }
+        Inst* term = terminator(pred);
+        if (!term || term->op != Op::Jmp || term->true_bb != header) {
+          simple = false;
+          break;
+        }
+        latches.push_back(pred);
+      }
+      if (!simple || latches.empty() || !outside) {
+        continue;
+      }
+      const Inst saved = *compare;
+      for (int latch : latches) {
+        Inst cloned = saved;
+        cloned.dst = new_vreg();
+        cloned.dead = false;
+        const int dst = cloned.dst;
+        insert_before_term(latch, cloned);
+        Inst* term = terminator(latch);
+        if (!term) {
+          continue;
+        }
+        term->op = Op::Br;
+        term->a = dst;
+        term->true_bb = true_bb;
+        term->false_bb = false_bb;
+      }
+    }
+    rebuild_cfg();
+  }
+
+  void fuse_compares() {
+    std::vector<int> uses(alias_.size(), 0);
+    std::vector<std::pair<int, int>> def_at(alias_.size(), {-1, -1});
+    auto touch = [&](int vreg) {
+      vreg = resolve(vreg);
+      if (vreg >= 0 && vreg < static_cast<int>(uses.size())) {
+        ++uses[static_cast<std::size_t>(vreg)];
+      }
+    };
+    for (int block = 0; block < static_cast<int>(blocks_.size()); ++block) {
+      auto& insts = blocks_[static_cast<std::size_t>(block)].insts;
+      for (int index = 0; index < static_cast<int>(insts.size()); ++index) {
+        Inst& inst = insts[static_cast<std::size_t>(index)];
+        if (inst.dead) {
+          continue;
+        }
+        touch(inst.a);
+        touch(inst.b);
+        for (int arg : inst.args) {
+          touch(arg);
+        }
+        if (inst.dst >= 0) {
+          const int dst = resolve(inst.dst);
+          if (dst >= 0 && dst < static_cast<int>(def_at.size())) {
+            def_at[static_cast<std::size_t>(dst)] = {block, index};
+          }
+        }
+      }
+    }
+    for (Block& block : blocks_) {
+      for (Inst& inst : block.insts) {
+        if (inst.dead || inst.op != Op::Br) {
+          continue;
+        }
+        const int cond = resolve(inst.a);
+        if (cond < 0 || cond >= static_cast<int>(uses.size()) || uses[static_cast<std::size_t>(cond)] != 1) {
+          continue;
+        }
+        const auto at = def_at[static_cast<std::size_t>(cond)];
+        if (at.first < 0) {
+          continue;
+        }
+        Inst& compare = blocks_[static_cast<std::size_t>(at.first)].insts[static_cast<std::size_t>(at.second)];
+        const int code = cmp_code(compare.op);
+        if (compare.dead || code < 0) {
+          continue;
+        }
+        inst.op = Op::CBr;
+        inst.imm = code;
+        inst.a = compare.a;
+        inst.b = compare.b;
+        compare.dead = true;
+      }
+    }
   }
 
   void allocate() {
@@ -1989,13 +2300,64 @@ class FunctionCompiler {
       }
       case Op::Call: {
         const int nargs = static_cast<int>(inst.args.size());
-        for (int i = 0; i < nargs; ++i) {
-          const std::string held = load_vreg(out, inst.args[static_cast<std::size_t>(i)], "t0");
-          const int off = i < 8 ? shuffle_off_ + i * 8 : (i - 8) * 8;
-          out << '\t' << "sw " << held << ", " << off << "(s0)\n";
+        struct ArgSrc {
+          bool mem = false;
+          std::string reg;
+          int off = 0;
+          bool in_a = false;
+        };
+        std::vector<ArgSrc> srcs;
+        int a_sources = 0;
+        for (int arg : inst.args) {
+          ArgSrc src;
+          const int vreg = resolve(arg);
+          if (in_reg(vreg)) {
+            src.reg = reg_name(vreg);
+            src.in_a = src.reg.size() == 2 && src.reg[0] == 'a' && src.reg[1] >= '0' && src.reg[1] <= '7';
+            if (src.in_a) {
+              ++a_sources;
+            }
+          } else if (vreg >= 0 && vreg < static_cast<int>(spill_off_.size()) &&
+                     spill_off_[static_cast<std::size_t>(vreg)] >= 0) {
+            src.mem = true;
+            src.off = mem_off(vreg);
+          } else {
+            src.reg = "zero";
+          }
+          srcs.push_back(std::move(src));
         }
-        for (int i = 0; i < nargs && i < 8; ++i) {
-          out << '\t' << "lw a" << i << ", " << (shuffle_off_ + i * 8) << "(s0)\n";
+        const bool direct = nargs <= 8 && a_sources <= 3;
+        if (direct) {
+          const char* tmps[] = {"t0", "t1", "t2"};
+          int tmp_i = 0;
+          std::vector<std::string> held(static_cast<std::size_t>(nargs));
+          for (int i = 0; i < nargs; ++i) {
+            const std::string dest = "a" + std::to_string(i);
+            if (srcs[static_cast<std::size_t>(i)].in_a && srcs[static_cast<std::size_t>(i)].reg != dest) {
+              held[static_cast<std::size_t>(i)] = tmps[tmp_i];
+              out << '\t' << "mv " << tmps[tmp_i] << ", " << srcs[static_cast<std::size_t>(i)].reg << '\n';
+              ++tmp_i;
+            } else if (!srcs[static_cast<std::size_t>(i)].mem) {
+              held[static_cast<std::size_t>(i)] = srcs[static_cast<std::size_t>(i)].reg;
+            }
+          }
+          for (int i = 0; i < nargs; ++i) {
+            const std::string dest = "a" + std::to_string(i);
+            if (srcs[static_cast<std::size_t>(i)].mem) {
+              out << '\t' << "lw " << dest << ", " << srcs[static_cast<std::size_t>(i)].off << "(s0)\n";
+            } else if (held[static_cast<std::size_t>(i)] != dest) {
+              out << '\t' << "mv " << dest << ", " << held[static_cast<std::size_t>(i)] << '\n';
+            }
+          }
+        } else {
+          for (int i = 0; i < nargs; ++i) {
+            const std::string held = load_vreg(out, inst.args[static_cast<std::size_t>(i)], "t0");
+            const int off = i < 8 ? shuffle_off_ + i * 8 : (i - 8) * 8;
+            out << '\t' << "sw " << held << ", " << off << "(s0)\n";
+          }
+          for (int i = 0; i < nargs && i < 8; ++i) {
+            out << '\t' << "lw a" << i << ", " << (shuffle_off_ + i * 8) << "(s0)\n";
+          }
         }
         out << '\t' << "call " << inst.name << '\n';
         if (inst.dst >= 0) {
@@ -2029,6 +2391,68 @@ class FunctionCompiler {
         } else {
           out << '\t' << "beq " << cond << ", zero, " << label(inst.false_bb) << '\n';
           out << '\t' << "j " << label(inst.true_bb) << '\n';
+        }
+        break;
+      }
+      case Op::CBr: {
+        const std::string lhs = load_vreg(out, inst.a, "t0");
+        const std::string rhs = inst.imm >= 6 ? std::string("zero") : load_vreg(out, inst.b, "t1");
+        const char* when_true = "blt";
+        const char* when_false = "bge";
+        std::string true_l = lhs;
+        std::string true_r = rhs;
+        std::string false_l = lhs;
+        std::string false_r = rhs;
+        switch (inst.imm) {
+          case 0:
+            break;
+          case 1:
+            true_l = rhs;
+            true_r = lhs;
+            false_l = rhs;
+            false_r = lhs;
+            break;
+          case 2:
+            when_true = "bge";
+            when_false = "blt";
+            true_l = rhs;
+            true_r = lhs;
+            false_l = rhs;
+            false_r = lhs;
+            break;
+          case 3:
+            when_true = "bge";
+            when_false = "blt";
+            break;
+          case 4:
+            when_true = "beq";
+            when_false = "bne";
+            break;
+          case 5:
+            when_true = "bne";
+            when_false = "beq";
+            break;
+          case 6:
+            when_true = "beq";
+            when_false = "bne";
+            true_r = "zero";
+            false_r = "zero";
+            break;
+          default:
+            when_true = "bne";
+            when_false = "beq";
+            true_r = "zero";
+            false_r = "zero";
+            break;
+        }
+        if (next == inst.false_bb) {
+          out << '\t' << when_true << ' ' << true_l << ", " << true_r << ", " << label(inst.true_bb) << '\n';
+        } else if (next == inst.true_bb) {
+          out << '\t' << when_false << ' ' << false_l << ", " << false_r << ", " << label(inst.false_bb)
+              << '\n';
+        } else {
+          out << '\t' << when_true << ' ' << true_l << ", " << true_r << ", " << label(inst.true_bb) << '\n';
+          out << '\t' << "j " << label(inst.false_bb) << '\n';
         }
         break;
       }
@@ -2361,8 +2785,8 @@ int FunctionCompiler::emit_call(const CallExprNode& call, bool tail) {
     return zero_vreg_;
   }
   const auto found = funcs_.find(call.name);
-  if (found != funcs_.end() && inline_depth_ < 2 && inline_stack_.count(call.name) == 0 &&
-      stmt_nodes(*found->second->body) <= 32) {
+  if (found != funcs_.end() && inline_depth_ < 4 && inline_stack_.count(call.name) == 0 &&
+      found->second->body && stmt_nodes(*found->second->body) <= 160) {
     return emit_inline(*found->second, call);
   }
   std::vector<int> args;
