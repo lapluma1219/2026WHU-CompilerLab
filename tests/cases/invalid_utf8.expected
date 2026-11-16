@@ -1,0 +1,5 @@
+reject
+0 illegal character '\xff'
+
+0:Ident:"a"
+1:Ident:"b"

@@ -1,0 +1,10 @@
+compiler
+build/
+tests/lexer_locations_test
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+*.o
+*.obj
+*.exe

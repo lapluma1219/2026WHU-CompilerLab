@@ -1,0 +1,5 @@
+reject
+1 illegal character '$'
+
+0:'int':"int"
+1:Ident:"main"

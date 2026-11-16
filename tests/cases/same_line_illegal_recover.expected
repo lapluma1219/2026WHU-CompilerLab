@@ -1,0 +1,23 @@
+reject
+0 illegal character '$'
+0 illegal character '#'
+0 illegal character '?'
+1 illegal character '&'
+1 illegal character '|'
+2 illegal character '$'
+2 illegal character '#'
+3 illegal character '$'
+
+0:'int':"int"
+1:Ident:"a"
+2:'=':"="
+3:IntConst:"1"
+4:';':";"
+5:Ident:"b"
+6:Ident:"c"
+7:Ident:"d"
+8:Ident:"x"
+9:Ident:"y"
+10:Ident:"z"
+11:IntConst:"1"
+12:IntConst:"2"
