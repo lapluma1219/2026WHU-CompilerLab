@@ -82,11 +82,12 @@ int main(int argc, char** argv) {
   }
 
   std::vector<toyc::Diagnostic> syntax;
-  toyc::Parser parser(lex.tokens, syntax);
+  toyc::Parser parser(lex.tokens, syntax, lex.eof_line, lex.eof_column);
   // 树只留在内存里供语义分析和后续代码生成使用，-ast 不打印树。
   std::unique_ptr<toyc::CompUnit> unit = parser.parse();
   std::vector<toyc::Diagnostic> semantic;
-  if (unit) {
+  // 参考文档：语法通过之后才做语义检查，避免未闭合结构再派生 missing return。
+  if (syntax.empty() && unit) {
     toyc::analyze(*unit, semantic);
   }
   std::vector<toyc::Diagnostic> all = lex.diagnostics;

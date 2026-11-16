@@ -11,6 +11,8 @@ namespace toyc {
 struct LexResult {
   std::vector<Token> tokens;
   std::vector<Diagnostic> diagnostics;
+  int eof_line = 0;
+  int eof_column = 0;
 };
 
 // 手写扫描器。后续语法分析可以重复调用 tokenize，不依赖 stdout。

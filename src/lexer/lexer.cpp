@@ -1,6 +1,7 @@
 #include "lexer/lexer.hpp"
 
 #include <iomanip>
+#include <utility>
 #include <sstream>
 #include <utility>
 
@@ -339,7 +340,12 @@ LexResult Lexer::tokenize() {
     }
     scan_one();
   }
-  return LexResult{tokens_, diagnostics_};
+  LexResult result;
+  result.tokens = std::move(tokens_);
+  result.diagnostics = std::move(diagnostics_);
+  result.eof_line = line_;
+  result.eof_column = column_;
+  return result;
 }
 
 }  // namespace toyc

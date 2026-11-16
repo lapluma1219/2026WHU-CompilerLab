@@ -2,8 +2,9 @@
 
 namespace toyc {
 
-Parser::Parser(const std::vector<Token>& tokens, std::vector<Diagnostic>& errors)
-    : tokens_(tokens), errors_(errors) {}
+Parser::Parser(const std::vector<Token>& tokens, std::vector<Diagnostic>& errors, int eof_line,
+               int eof_column)
+    : tokens_(tokens), errors_(errors), eof_line_(eof_line), eof_column_(eof_column) {}
 
 bool Parser::eof() const { return pos_ >= tokens_.size(); }
 
@@ -33,20 +34,14 @@ int Parser::error_line() const {
   if (const Token* token = peek()) {
     return token->line;
   }
-  if (!tokens_.empty()) {
-    return tokens_.back().line;
-  }
-  return 0;
+  return eof_line_;
 }
 
 int Parser::error_column() const {
   if (const Token* token = peek()) {
     return token->column;
   }
-  if (!tokens_.empty()) {
-    return tokens_.back().column;
-  }
-  return 0;
+  return eof_column_;
 }
 
 void Parser::error_at(int line, int column, const std::string& message) {
@@ -183,6 +178,13 @@ std::unique_ptr<BlockStmt> Parser::parse_block() {
 }
 
 std::unique_ptr<Stmt> Parser::parse_stmt() {
+  if (eof() || check(TokenKind::RBrace) || check(TokenKind::KwElse)) {
+    error_here("Lack of statement");
+    auto stmt = std::make_unique<EmptyStmt>();
+    stmt->line = error_line();
+    stmt->column = error_column();
+    return stmt;
+  }
   if (check(TokenKind::LBrace)) {
     return parse_block();
   }
@@ -227,17 +229,7 @@ std::unique_ptr<Stmt> Parser::parse_if() {
   stmt->line = error_line();
   stmt->column = error_column();
   ++pos_;
-  if (!check(TokenKind::LParen)) {
-    error_here("Lack of '('");
-  } else {
-    ++pos_;
-  }
-  stmt->cond = parse_expr();
-  if (check(TokenKind::RParen)) {
-    ++pos_;
-  } else {
-    error_here("Lack of ')'");
-  }
+  stmt->cond = parse_paren_condition();
   stmt->then_stmt = parse_stmt();
   if (match(TokenKind::KwElse)) {
     stmt->else_stmt = parse_stmt();
@@ -250,19 +242,49 @@ std::unique_ptr<Stmt> Parser::parse_while() {
   stmt->line = error_line();
   stmt->column = error_column();
   ++pos_;
+  stmt->cond = parse_paren_condition();
+  stmt->body = parse_stmt();
+  return stmt;
+}
+
+bool Parser::can_start_expr() const {
+  return check(TokenKind::Ident) || check(TokenKind::IntConst) || check(TokenKind::LParen) ||
+         check(TokenKind::Plus) || check(TokenKind::Minus) || check(TokenKind::Not);
+}
+
+std::unique_ptr<Expr> Parser::parse_paren_condition() {
+  auto bad = [&]() {
+    auto expr = std::make_unique<BadExpr>();
+    expr->line = error_line();
+    expr->column = error_column();
+    return expr;
+  };
   if (!check(TokenKind::LParen)) {
     error_here("Lack of '('");
-  } else {
-    ++pos_;
+    if (!can_start_expr()) {
+      return bad();
+    }
+    auto expr = parse_expr();
+    if (check(TokenKind::RParen)) {
+      ++pos_;
+    }
+    return expr;
   }
-  stmt->cond = parse_expr();
+  ++pos_;
+  if (!can_start_expr()) {
+    error_here("Lack of expression");
+    if (check(TokenKind::RParen)) {
+      ++pos_;
+    }
+    return bad();
+  }
+  auto expr = parse_expr();
   if (check(TokenKind::RParen)) {
     ++pos_;
   } else {
     error_here("Lack of ')'");
   }
-  stmt->body = parse_stmt();
-  return stmt;
+  return expr;
 }
 
 std::unique_ptr<Stmt> Parser::parse_return() {
