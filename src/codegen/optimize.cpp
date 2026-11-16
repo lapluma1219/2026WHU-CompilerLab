@@ -2108,6 +2108,835 @@ class FunctionCompiler {
     (void)inst_needed_mark;
   }
 
+  struct LinForm {
+    int32_t imm = 0;
+    std::vector<std::pair<int, int32_t>> terms;
+  };
+
+  static int log2_floor_u32(uint32_t value) {
+    int shift = 0;
+    while (value > 1u) {
+      value >>= 1;
+      ++shift;
+    }
+    return shift;
+  }
+
+  // 把系数变成指令条数。2 的幂用移位，2^k±1 用移位加减，其余用 li+mul。负数直接乘，不再多一条 neg。
+  static int scale_cost(int32_t coeff) {
+    if (coeff == 1) {
+      return 0;
+    }
+    if (coeff == -1 || coeff == INT32_MIN) {
+      return 1;
+    }
+    if (coeff > 1 && (coeff & (coeff - 1)) == 0) {
+      return 1;
+    }
+    if (coeff < 0) {
+      const int32_t mag = static_cast<int32_t>(-static_cast<int64_t>(coeff));
+      if (mag > 0 && (mag & (mag - 1)) == 0) {
+        return 2;
+      }
+    }
+    if (coeff > 1 && ((coeff - 1) & (coeff - 2)) == 0) {
+      return 2;
+    }
+    if (coeff > 1 && (coeff & (coeff + 1)) == 0) {
+      return 2;
+    }
+    return 2;
+  }
+
+  static int form_cost(const LinForm& form) {
+    if (form.terms.empty()) {
+      return 1;
+    }
+    int cost = 0;
+    bool first = true;
+    for (const auto& term : form.terms) {
+      cost += scale_cost(term.second);
+      if (!first) {
+        ++cost;
+      }
+      first = false;
+    }
+    if (form.imm != 0) {
+      ++cost;
+    }
+    if (cost == 0) {
+      return 1;
+    }
+    return cost;
+  }
+
+  void add_lin_term(LinForm& form, int base, int32_t coeff) const {
+    if (coeff == 0 || base < 0) {
+      return;
+    }
+    for (auto& term : form.terms) {
+      if (term.first == base) {
+        term.second = add32(term.second, coeff);
+        if (term.second == 0) {
+          term = form.terms.back();
+          form.terms.pop_back();
+        }
+        return;
+      }
+    }
+    form.terms.push_back({base, coeff});
+  }
+
+  void add_lin_form(LinForm& dst, const LinForm& src, int32_t scale) const {
+    dst.imm = add32(dst.imm, mul32(src.imm, scale));
+    for (const auto& term : src.terms) {
+      add_lin_term(dst, term.first, mul32(term.second, scale));
+    }
+  }
+
+  // 同一基本块里，把只被加法使用的链收成系数和。模 2^32，只有指令变少才替换。
+  void fold_linear_adds() {
+    for (int block_index = 0; block_index < static_cast<int>(blocks_.size()); ++block_index) {
+      Block& block = blocks_[static_cast<std::size_t>(block_index)];
+      std::unordered_map<int, int> def_at;
+      std::unordered_set<int> linear_at;
+      for (int index = 0; index < static_cast<int>(block.insts.size()); ++index) {
+        Inst& inst = block.insts[static_cast<std::size_t>(index)];
+        if (inst.dead || inst.dst < 0) {
+          continue;
+        }
+        const int dst = resolve(inst.dst);
+        def_at[dst] = index;
+        int32_t dummy = 0;
+        const bool mul_const = inst.op == Op::Mul && (get_const(inst.a, dummy) || get_const(inst.b, dummy));
+        if (inst.op == Op::Add || inst.op == Op::Addi || inst.op == Op::Sub || inst.op == Op::Neg ||
+            inst.op == Op::Mov || inst.op == Op::Shl || mul_const) {
+          linear_at.insert(dst);
+        }
+      }
+      if (linear_at.size() < 2) {
+        continue;
+      }
+      std::unordered_map<int, std::vector<int>> users;
+      auto note_use = [&](int vreg, int user_dst) {
+        vreg = resolve(vreg);
+        if (linear_at.count(vreg) != 0) {
+          users[vreg].push_back(user_dst);
+        }
+      };
+      for (const Inst& inst : block.insts) {
+        if (inst.dead) {
+          continue;
+        }
+        const int user = inst.dst >= 0 ? resolve(inst.dst) : -1;
+        note_use(inst.a, user);
+        note_use(inst.b, user);
+        for (int arg : inst.args) {
+          note_use(arg, user);
+        }
+      }
+      for (const Phi& phi : phis_) {
+        if (phi.dead) {
+          continue;
+        }
+        for (const auto& incoming : phi.incoming) {
+          const int vreg = resolve(incoming.second);
+          if (linear_at.count(vreg) != 0) {
+            users[vreg].push_back(-2);
+          }
+        }
+      }
+      std::unordered_set<int> fold;
+      for (int dst : linear_at) {
+        bool all_linear = !users[dst].empty();
+        for (int user : users[dst]) {
+          if (user < 0 || linear_at.count(user) == 0 || def_at.count(user) == 0) {
+            all_linear = false;
+          }
+        }
+        if (all_linear) {
+          fold.insert(dst);
+        }
+      }
+      bool promoted = true;
+      while (promoted) {
+        promoted = false;
+        std::vector<int> drop;
+        for (int dst : fold) {
+          std::unordered_set<int> sinks;
+          std::vector<int> stack = users[dst];
+          std::unordered_set<int> seen;
+          while (!stack.empty()) {
+            const int user = stack.back();
+            stack.pop_back();
+            if (user < 0 || !seen.insert(user).second) {
+              continue;
+            }
+            if (fold.count(user) != 0) {
+              stack.insert(stack.end(), users[user].begin(), users[user].end());
+            } else {
+              sinks.insert(user);
+            }
+          }
+          if (sinks.size() != 1) {
+            drop.push_back(dst);
+          }
+        }
+        for (int dst : drop) {
+          fold.erase(dst);
+          promoted = true;
+        }
+      }
+      if (fold.empty()) {
+        continue;
+      }
+      std::unordered_map<int, LinForm> forms;
+      auto form_of = [&](int vreg) {
+        LinForm form;
+        vreg = resolve(vreg);
+        int32_t constant = 0;
+        if (lookup_const(vreg, constant)) {
+          form.imm = constant;
+          return form;
+        }
+        if (fold.count(vreg) != 0 && forms.count(vreg) != 0) {
+          return forms[vreg];
+        }
+        form.terms.push_back({vreg, 1});
+        return form;
+      };
+      for (const Inst& inst : block.insts) {
+        if (inst.dead || inst.dst < 0 || linear_at.count(resolve(inst.dst)) == 0) {
+          continue;
+        }
+        LinForm form;
+        int32_t lhs_c = 0;
+        int32_t rhs_c = 0;
+        const bool lhs_const = get_const(inst.a, lhs_c);
+        const bool rhs_const = get_const(inst.b, rhs_c);
+        if (inst.op == Op::Add) {
+          form = form_of(inst.a);
+          add_lin_form(form, form_of(inst.b), 1);
+        } else if (inst.op == Op::Addi) {
+          form = form_of(inst.a);
+          form.imm = add32(form.imm, inst.imm);
+        } else if (inst.op == Op::Sub) {
+          form = form_of(inst.a);
+          add_lin_form(form, form_of(inst.b), -1);
+        } else if (inst.op == Op::Neg) {
+          add_lin_form(form, form_of(inst.a), -1);
+        } else if (inst.op == Op::Mov) {
+          form = form_of(inst.a);
+        } else if (inst.op == Op::Shl && inst.imm >= 0 && inst.imm <= 31) {
+          add_lin_form(form, form_of(inst.a), static_cast<int32_t>(1u << inst.imm));
+        } else if (inst.op == Op::Mul && (lhs_const || rhs_const)) {
+          const int32_t factor = rhs_const ? rhs_c : lhs_c;
+          const int other = rhs_const ? inst.a : inst.b;
+          add_lin_form(form, form_of(other), factor);
+        } else {
+          form.terms.push_back({resolve(inst.dst), 1});
+        }
+        forms[resolve(inst.dst)] = form;
+      }
+      std::unordered_map<int, std::vector<Inst>> replace;
+      for (int dst : linear_at) {
+        if (fold.count(dst) != 0 || forms.count(dst) == 0) {
+          continue;
+        }
+        const LinForm& form = forms[dst];
+        std::unordered_set<int> cone;
+        for (int folded : fold) {
+          std::unordered_set<int> sinks;
+          std::vector<int> walk = users[folded];
+          std::unordered_set<int> seen;
+          while (!walk.empty()) {
+            const int user = walk.back();
+            walk.pop_back();
+            if (user < 0 || !seen.insert(user).second) {
+              continue;
+            }
+            if (fold.count(user) != 0) {
+              walk.insert(walk.end(), users[user].begin(), users[user].end());
+            } else {
+              sinks.insert(user);
+            }
+          }
+          if (sinks.size() == 1 && sinks.count(dst) != 0) {
+            cone.insert(folded);
+          }
+        }
+        const int cone_size = static_cast<int>(cone.size()) + 1;
+        if (form_cost(form) >= cone_size || cone.empty()) {
+          continue;
+        }
+        std::vector<Inst> seq;
+        int current = -1;
+        auto emit = [&](Inst inst) {
+          seq.push_back(inst);
+          return inst.dst;
+        };
+        auto piece = [&](int base, int32_t coeff) {
+          if (coeff == 1) {
+            return base;
+          }
+          if (coeff == -1) {
+            Inst neg;
+            neg.op = Op::Neg;
+            neg.a = base;
+            neg.dst = new_vreg();
+            return emit(neg);
+          }
+          auto shl_to = [&](int src, int amount) {
+            Inst shifted;
+            shifted.op = Op::Shl;
+            shifted.a = src;
+            shifted.imm = amount;
+            shifted.dst = new_vreg();
+            return emit(shifted);
+          };
+          if (coeff == INT32_MIN) {
+            return shl_to(base, 31);
+          }
+          if (coeff > 1 && (coeff & (coeff - 1)) == 0) {
+            return shl_to(base, log2_floor_u32(static_cast<uint32_t>(coeff)));
+          }
+          if (coeff < -1) {
+            const int32_t mag = static_cast<int32_t>(-static_cast<int64_t>(coeff));
+            if (mag > 0 && (mag & (mag - 1)) == 0) {
+              const int shifted = shl_to(base, log2_floor_u32(static_cast<uint32_t>(mag)));
+              Inst neg;
+              neg.op = Op::Neg;
+              neg.a = shifted;
+              neg.dst = new_vreg();
+              return emit(neg);
+            }
+          }
+          if (coeff > 1 && ((coeff - 1) & (coeff - 2)) == 0) {
+            const int shifted = shl_to(base, log2_floor_u32(static_cast<uint32_t>(coeff - 1)));
+            Inst add;
+            add.op = Op::Add;
+            add.a = shifted;
+            add.b = base;
+            add.dst = new_vreg();
+            return emit(add);
+          }
+          if (coeff > 1 && (coeff & (coeff + 1)) == 0) {
+            const int shifted = shl_to(base, log2_floor_u32(static_cast<uint32_t>(coeff + 1)));
+            Inst sub;
+            sub.op = Op::Sub;
+            sub.a = shifted;
+            sub.b = base;
+            sub.dst = new_vreg();
+            return emit(sub);
+          }
+          Inst scale;
+          scale.op = Op::Li;
+          scale.imm = coeff;
+          scale.dst = new_vreg();
+          emit(scale);
+          Inst mul;
+          mul.op = Op::Mul;
+          mul.a = base;
+          mul.b = scale.dst;
+          mul.dst = new_vreg();
+          return emit(mul);
+        };
+        for (const auto& term : form.terms) {
+          const int part = piece(term.first, term.second);
+          if (current < 0) {
+            current = part;
+            continue;
+          }
+          Inst add;
+          add.op = Op::Add;
+          add.a = current;
+          add.b = part;
+          add.dst = new_vreg();
+          current = emit(add);
+        }
+        if (form.imm != 0) {
+          if (current < 0) {
+            Inst load;
+            load.op = Op::Li;
+            load.imm = form.imm;
+            load.dst = new_vreg();
+            current = emit(load);
+          } else if (fits12(form.imm)) {
+            Inst add;
+            add.op = Op::Addi;
+            add.a = current;
+            add.imm = form.imm;
+            add.dst = new_vreg();
+            current = emit(add);
+          } else {
+            Inst load;
+            load.op = Op::Li;
+            load.imm = form.imm;
+            load.dst = new_vreg();
+            emit(load);
+            Inst add;
+            add.op = Op::Add;
+            add.a = current;
+            add.b = load.dst;
+            add.dst = new_vreg();
+            current = emit(add);
+          }
+        }
+        if (current < 0) {
+          Inst load;
+          load.op = Op::Li;
+          load.imm = 0;
+          load.dst = new_vreg();
+          current = emit(load);
+        }
+        if (current != dst) {
+          if (!seq.empty() && seq.back().dst == current) {
+            seq.back().dst = dst;
+          } else {
+            Inst mov;
+            mov.op = Op::Mov;
+            mov.a = current;
+            mov.dst = dst;
+            emit(mov);
+          }
+        }
+        if (static_cast<int>(seq.size()) < cone_size) {
+          replace[dst] = std::move(seq);
+        }
+      }
+      if (replace.empty()) {
+        continue;
+      }
+      std::vector<Inst> rebuilt;
+      for (Inst& inst : block.insts) {
+        if (!inst.dead && inst.dst >= 0 && replace.count(resolve(inst.dst)) != 0) {
+          const auto& seq = replace[resolve(inst.dst)];
+          rebuilt.insert(rebuilt.end(), seq.begin(), seq.end());
+          continue;
+        }
+        rebuilt.push_back(std::move(inst));
+      }
+      block.insts = std::move(rebuilt);
+    }
+  }
+
+  // 分支走到的后继上，条件值是常量。只改被该后继支配的使用，不移动调用。
+  void propagate_edge_facts() {
+    index_defs();
+    rebuild_cfg();
+    compute_dom();
+    const int n = static_cast<int>(blocks_.size());
+    struct Fact {
+      int cond = -1;
+      int value = 0;
+      int block = -1;
+      int li = -1;
+    };
+    std::vector<Fact> facts;
+    for (int block = 0; block < n; ++block) {
+      if (blocks_[static_cast<std::size_t>(block)].preds.size() != 1) {
+        continue;
+      }
+      const int pred = blocks_[static_cast<std::size_t>(block)].preds[0];
+      Inst* term = terminator(pred);
+      if (!term || term->op != Op::Br || term->true_bb == term->false_bb) {
+        continue;
+      }
+      int taken = -1;
+      if (term->true_bb == block) {
+        taken = 1;
+      } else if (term->false_bb == block) {
+        taken = 0;
+      }
+      if (taken < 0) {
+        continue;
+      }
+      const int cond = resolve(term->a);
+      if (cond < 0) {
+        continue;
+      }
+      // 分支成立只说明值非零。只有比较指令的结果才一定是 0 或 1。
+      const Inst* cond_def = def_inst(cond);
+      if (!cond_def || !is_cmp(cond_def->op)) {
+        continue;
+      }
+      const int home = cond < static_cast<int>(def_block_.size()) ? def_block_[static_cast<std::size_t>(cond)] : -1;
+      if (home >= 0 && dominates(block, home)) {
+        continue;
+      }
+      Fact fact;
+      fact.cond = cond;
+      fact.value = taken;
+      fact.block = block;
+      fact.li = new_vreg();
+      Inst load;
+      load.op = Op::Li;
+      load.dst = fact.li;
+      load.imm = taken;
+      blocks_[static_cast<std::size_t>(block)].insts.insert(blocks_[static_cast<std::size_t>(block)].insts.begin(),
+                                                             load);
+      facts.push_back(fact);
+    }
+    for (const Fact& fact : facts) {
+      for (int block = 0; block < n; ++block) {
+        if (!dominates(fact.block, block)) {
+          continue;
+        }
+        for (Inst& inst : blocks_[static_cast<std::size_t>(block)].insts) {
+          if (inst.dst == fact.li) {
+            continue;
+          }
+          auto rewrite = [&](int& slot) {
+            if (resolve(slot) == fact.cond) {
+              slot = fact.li;
+            }
+          };
+          rewrite(inst.a);
+          rewrite(inst.b);
+          for (int& arg : inst.args) {
+            rewrite(arg);
+          }
+        }
+        for (int phi_index : blocks_[static_cast<std::size_t>(block)].phis) {
+          Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
+          for (auto& incoming : phi.incoming) {
+            if (resolve(incoming.second) == fact.cond) {
+              incoming.second = fact.li;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  void unswitch_invariant_branches() {
+    for (int round = 0; round < 3; ++round) {
+      rebuild_cfg();
+      compute_dom();
+      index_defs();
+      const int n = static_cast<int>(blocks_.size());
+      int header = -1;
+      int preheader = -1;
+      int branch_block = -1;
+      int branch_index = -1;
+      std::unordered_set<int> loop;
+      for (int candidate = 0; candidate < n && header < 0; ++candidate) {
+        std::vector<int> latches;
+        for (int pred : blocks_[static_cast<std::size_t>(candidate)].preds) {
+          if (dominates(candidate, pred)) {
+            latches.push_back(pred);
+          }
+        }
+        if (latches.size() != 1) {
+          continue;
+        }
+        int outside = -1;
+        bool two_outside = false;
+        for (int pred : blocks_[static_cast<std::size_t>(candidate)].preds) {
+          if (!dominates(candidate, pred)) {
+            if (outside < 0) {
+              outside = pred;
+            } else {
+              two_outside = true;
+            }
+          }
+        }
+        Inst* pre_term = outside >= 0 ? terminator(outside) : nullptr;
+        if (two_outside || outside < 0 || !pre_term || pre_term->op != Op::Jmp || pre_term->true_bb != candidate) {
+          continue;
+        }
+        std::unordered_set<int> body;
+        std::vector<int> stack = latches;
+        body.insert(candidate);
+        while (!stack.empty()) {
+          const int block = stack.back();
+          stack.pop_back();
+          if (block < 0 || !dominates(candidate, block) || !body.insert(block).second) {
+            continue;
+          }
+          for (int pred : blocks_[static_cast<std::size_t>(block)].preds) {
+            stack.push_back(pred);
+          }
+        }
+        if (body.size() > 24) {
+          continue;
+        }
+        for (int block : body) {
+          const auto& insts = blocks_[static_cast<std::size_t>(block)].insts;
+          for (int index = 0; index < static_cast<int>(insts.size()); ++index) {
+            const Inst& inst = insts[static_cast<std::size_t>(index)];
+            if (inst.dead || inst.op != Op::Br || inst.true_bb == inst.false_bb) {
+              continue;
+            }
+            if (body.count(inst.true_bb) == 0 || body.count(inst.false_bb) == 0) {
+              continue;
+            }
+            const int cond = resolve(inst.a);
+            int32_t ignore = 0;
+            if (lookup_const(cond, ignore)) {
+              continue;
+            }
+            const int home = cond >= 0 && cond < static_cast<int>(def_block_.size())
+                                 ? def_block_[static_cast<std::size_t>(cond)]
+                                 : -1;
+            if (home >= 0 && body.count(home) != 0) {
+              continue;
+            }
+            if (home >= 0 && !dominates(home, outside)) {
+              continue;
+            }
+            header = candidate;
+            preheader = outside;
+            branch_block = block;
+            branch_index = index;
+            loop = std::move(body);
+            break;
+          }
+          if (header >= 0) {
+            break;
+          }
+        }
+      }
+      if (header < 0) {
+        return;
+      }
+      bool extra_entry = false;
+      for (int block : loop) {
+        for (int pred : blocks_[static_cast<std::size_t>(block)].preds) {
+          if (loop.count(pred) == 0 && pred != preheader) {
+            extra_entry = true;
+          }
+        }
+      }
+      if (extra_entry) {
+        return;
+      }
+      std::unordered_set<int> loop_defs;
+      std::unordered_set<int> exits;
+      for (int block : loop) {
+        for (const Inst& inst : blocks_[static_cast<std::size_t>(block)].insts) {
+          if (!inst.dead && inst.dst >= 0) {
+            loop_defs.insert(resolve(inst.dst));
+          }
+          if (!inst.dead && is_term(inst.op)) {
+            if (inst.true_bb >= 0 && loop.count(inst.true_bb) == 0) {
+              exits.insert(inst.true_bb);
+            }
+            if (inst.false_bb >= 0 && loop.count(inst.false_bb) == 0) {
+              exits.insert(inst.false_bb);
+            }
+          }
+        }
+        for (int phi_index : blocks_[static_cast<std::size_t>(block)].phis) {
+          const Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
+          if (!phi.dead) {
+            loop_defs.insert(resolve(phi.dst));
+          }
+        }
+      }
+      bool escaped_far = false;
+      for (int block = 0; block < static_cast<int>(blocks_.size()); ++block) {
+        if (loop.count(block) != 0) {
+          continue;
+        }
+        auto uses_loop = [&](int vreg) { return loop_defs.count(resolve(vreg)) != 0; };
+        bool used = false;
+        for (const Inst& inst : blocks_[static_cast<std::size_t>(block)].insts) {
+          if (inst.dead) {
+            continue;
+          }
+          if (uses_loop(inst.a) || uses_loop(inst.b)) {
+            used = true;
+          }
+          for (int arg : inst.args) {
+            if (uses_loop(arg)) {
+              used = true;
+            }
+          }
+        }
+        for (int phi_index : blocks_[static_cast<std::size_t>(block)].phis) {
+          const Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
+          for (const auto& incoming : phi.incoming) {
+            if (uses_loop(incoming.second)) {
+              used = true;
+            }
+          }
+        }
+        if (used && exits.count(block) == 0) {
+          escaped_far = true;
+        }
+      }
+      if (escaped_far) {
+        return;
+      }
+      std::unordered_map<int, int> map_true;
+      std::unordered_map<int, int> map_false;
+      for (int block : loop) {
+        map_true[block] = new_block();
+        map_false[block] = new_block();
+      }
+      std::unordered_map<int, int> vtrue;
+      std::unordered_map<int, int> vfalse;
+      auto remember = [&](int dst, std::unordered_map<int, int>& map) {
+        dst = resolve(dst);
+        if (dst >= 0 && map.count(dst) == 0) {
+          map[dst] = new_vreg();
+        }
+      };
+      for (int block : loop) {
+        for (const Inst& inst : blocks_[static_cast<std::size_t>(block)].insts) {
+          if (!inst.dead && inst.dst >= 0) {
+            remember(inst.dst, vtrue);
+            remember(inst.dst, vfalse);
+          }
+        }
+        for (int phi_index : blocks_[static_cast<std::size_t>(block)].phis) {
+          const Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
+          if (!phi.dead) {
+            remember(phi.dst, vtrue);
+            remember(phi.dst, vfalse);
+          }
+        }
+      }
+      const Inst& source_branch = blocks_[static_cast<std::size_t>(branch_block)].insts[static_cast<std::size_t>(branch_index)];
+      const int cond = resolve(source_branch.a);
+      const int true_target = source_branch.true_bb;
+      const int false_target = source_branch.false_bb;
+      auto clone_side = [&](const std::unordered_map<int, int>& blocks_map, const std::unordered_map<int, int>& vmap,
+                            int taken_target) {
+        auto map_block = [&](int block) {
+          const auto found = blocks_map.find(block);
+          return found == blocks_map.end() ? block : found->second;
+        };
+        auto map_value = [&](int vreg) {
+          vreg = resolve(vreg);
+          const auto found = vmap.find(vreg);
+          return found == vmap.end() ? vreg : found->second;
+        };
+        for (int block : loop) {
+          const int cloned = blocks_map.at(block);
+          for (int phi_index : blocks_[static_cast<std::size_t>(block)].phis) {
+            const Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
+            if (phi.dead) {
+              continue;
+            }
+            Phi copy = phi;
+            copy.dst = map_value(phi.dst);
+            copy.block = cloned;
+            for (auto& incoming : copy.incoming) {
+              incoming.first = map_block(incoming.first);
+              incoming.second = map_value(incoming.second);
+            }
+            blocks_[static_cast<std::size_t>(cloned)].phis.push_back(static_cast<int>(phis_.size()));
+            phis_.push_back(std::move(copy));
+          }
+          for (int index = 0; index < static_cast<int>(blocks_[static_cast<std::size_t>(block)].insts.size()); ++index) {
+            Inst inst = blocks_[static_cast<std::size_t>(block)].insts[static_cast<std::size_t>(index)];
+            if (inst.dead) {
+              continue;
+            }
+            auto rewrite = [&](int& slot) { slot = map_value(slot); };
+            rewrite(inst.a);
+            rewrite(inst.b);
+            for (int& arg : inst.args) {
+              rewrite(arg);
+            }
+            if (inst.dst >= 0) {
+              inst.dst = map_value(inst.dst);
+            }
+            inst.true_bb = map_block(inst.true_bb);
+            inst.false_bb = map_block(inst.false_bb);
+            if (block == branch_block && index == branch_index) {
+              inst.op = Op::Jmp;
+              inst.a = -1;
+              inst.true_bb = map_block(taken_target);
+              inst.false_bb = -1;
+            }
+            blocks_[static_cast<std::size_t>(cloned)].insts.push_back(std::move(inst));
+          }
+        }
+      };
+      clone_side(map_true, vtrue, true_target);
+      clone_side(map_false, vfalse, false_target);
+      for (Phi& phi : phis_) {
+        if (phi.dead || loop.count(phi.block) != 0) {
+          continue;
+        }
+        std::vector<std::pair<int, int>> incoming;
+        for (const auto& edge : phi.incoming) {
+          if (loop.count(edge.first) == 0) {
+            incoming.push_back(edge);
+            continue;
+          }
+          const int value = resolve(edge.second);
+          const int true_value = vtrue.count(value) != 0 ? vtrue[value] : value;
+          const int false_value = vfalse.count(value) != 0 ? vfalse[value] : value;
+          incoming.push_back({map_true[edge.first], true_value});
+          incoming.push_back({map_false[edge.first], false_value});
+        }
+        phi.incoming = std::move(incoming);
+      }
+      for (int exit_block : exits) {
+        std::unordered_set<int> needed;
+        auto consider = [&](int vreg) {
+          vreg = resolve(vreg);
+          if (loop_defs.count(vreg) != 0) {
+            needed.insert(vreg);
+          }
+        };
+        for (const Inst& inst : blocks_[static_cast<std::size_t>(exit_block)].insts) {
+          if (inst.dead) {
+            continue;
+          }
+          consider(inst.a);
+          consider(inst.b);
+          for (int arg : inst.args) {
+            consider(arg);
+          }
+        }
+        for (int value : needed) {
+          Phi gate;
+          gate.dst = new_vreg();
+          gate.block = exit_block;
+          gate.var = -1;
+          for (int block : loop) {
+            const Inst* term = terminator(block);
+            if (!term) {
+              continue;
+            }
+            if (term->true_bb != exit_block && term->false_bb != exit_block) {
+              continue;
+            }
+            const int true_value = vtrue.count(value) != 0 ? vtrue[value] : value;
+            const int false_value = vfalse.count(value) != 0 ? vfalse[value] : value;
+            gate.incoming.push_back({map_true[block], true_value});
+            gate.incoming.push_back({map_false[block], false_value});
+          }
+          const int gate_dst = gate.dst;
+          blocks_[static_cast<std::size_t>(exit_block)].phis.push_back(static_cast<int>(phis_.size()));
+          phis_.push_back(std::move(gate));
+          for (Inst& inst : blocks_[static_cast<std::size_t>(exit_block)].insts) {
+            auto rewrite = [&](int& slot) {
+              if (resolve(slot) == value) {
+                slot = gate_dst;
+              }
+            };
+            rewrite(inst.a);
+            rewrite(inst.b);
+            for (int& arg : inst.args) {
+              rewrite(arg);
+            }
+          }
+        }
+      }
+      Inst* pre_term = terminator(preheader);
+      pre_term->op = Op::Br;
+      pre_term->a = cond;
+      pre_term->true_bb = map_true[header];
+      pre_term->false_bb = map_false[header];
+    }
+  }
+
   void optimize() {
     simplify_phis();
     flatten();
@@ -2131,6 +2960,16 @@ class FunctionCompiler {
     reduce_induction();
     propagate_constants();
     strength_reduce_ops();
+    fold_linear_adds();
+    propagate_constants();
+    rebuild_cfg();
+    compute_dom();
+    propagate_edge_facts();
+    propagate_constants();
+    eliminate_dead();
+    simplify_phis();
+    unswitch_invariant_branches();
+    propagate_constants();
     rebuild_cfg();
     compute_dom();
     eliminate_dead();
