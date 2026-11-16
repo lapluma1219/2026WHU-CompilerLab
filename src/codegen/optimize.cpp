@@ -407,6 +407,8 @@ class FunctionCompiler {
   std::vector<int> home_;
   std::vector<int> spill_off_;
   std::vector<uint8_t> crosses_;
+  std::vector<uint8_t> remat_;
+  std::vector<int32_t> remat_imm_;
   int frame_size_ = 0;
   int argsave_off_ = 0;
   int shuffle_off_ = 0;
@@ -4057,7 +4059,32 @@ class FunctionCompiler {
         order.push_back(vreg);
       }
     }
+    remat_.assign(static_cast<std::size_t>(nreg_v), 0);
+    remat_imm_.assign(static_cast<std::size_t>(nreg_v), 0);
+    for (const Block& block : blocks_) {
+      for (const Inst& inst : block.insts) {
+        if (inst.dead || inst.op != Op::Li || inst.dst < 0) {
+          continue;
+        }
+        const int dst = resolve(inst.dst);
+        if (dst < 0 || dst >= nreg_v) {
+          continue;
+        }
+        if (remat_[static_cast<std::size_t>(dst)] &&
+            remat_imm_[static_cast<std::size_t>(dst)] != inst.imm) {
+          remat_[static_cast<std::size_t>(dst)] = 0;
+          continue;
+        }
+        remat_[static_cast<std::size_t>(dst)] = 1;
+        remat_imm_[static_cast<std::size_t>(dst)] = inst.imm;
+      }
+    }
     std::sort(order.begin(), order.end(), [&](int lhs, int rhs) {
+      const bool left_remat = remat_[static_cast<std::size_t>(lhs)] != 0;
+      const bool right_remat = remat_[static_cast<std::size_t>(rhs)] != 0;
+      if (left_remat != right_remat) {
+        return !left_remat;
+      }
       if (crosses_[static_cast<std::size_t>(lhs)] != crosses_[static_cast<std::size_t>(rhs)]) {
         return crosses_[static_cast<std::size_t>(lhs)] > crosses_[static_cast<std::size_t>(rhs)];
       }
@@ -4112,6 +4139,9 @@ class FunctionCompiler {
     spill_off_.assign(static_cast<std::size_t>(nreg_v), -1);
     int spills = 0;
     for (int vreg = 0; vreg < nreg_v; ++vreg) {
+      if (remat_[static_cast<std::size_t>(vreg)]) {
+        continue;
+      }
       if (home_[static_cast<std::size_t>(vreg)] < 0 &&
           (cost[static_cast<std::size_t>(vreg)] > 0 || !adj[static_cast<std::size_t>(vreg)].empty())) {
         spill_off_[static_cast<std::size_t>(vreg)] = spills++;
@@ -4173,6 +4203,10 @@ class FunctionCompiler {
     }
     if (in_reg(vreg)) {
       return reg_name(vreg);
+    }
+    if (vreg < static_cast<int>(remat_.size()) && remat_[static_cast<std::size_t>(vreg)]) {
+      out << '\t' << "li " << tmp << ", " << remat_imm_[static_cast<std::size_t>(vreg)] << '\n';
+      return tmp;
     }
     if (vreg < static_cast<int>(spill_off_.size()) && spill_off_[static_cast<std::size_t>(vreg)] >= 0) {
       out << '\t' << "lw " << tmp << ", " << mem_off(vreg) << "(s0)\n";
@@ -4293,9 +4327,15 @@ class FunctionCompiler {
         }
         break;
       }
-      case Op::Li:
+      case Op::Li: {
+        const int dst = resolve(inst.dst);
+        if (dst >= 0 && dst < static_cast<int>(remat_.size()) && remat_[static_cast<std::size_t>(dst)] &&
+            !in_reg(inst.dst)) {
+          break;
+        }
         emit_result(out, "li", inst.dst, ", " + std::to_string(inst.imm));
         break;
+      }
       case Op::Mov:
         emit_move(out, inst.dst, inst.a);
         break;
