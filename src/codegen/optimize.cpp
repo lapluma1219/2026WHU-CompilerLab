@@ -28,6 +28,8 @@ enum class Op {
   Rem,
   Addi,
   Shl,
+  And,
+  Sra,
   Slt,
   Sgt,
   Sle,
@@ -950,6 +952,8 @@ class FunctionCompiler {
       case Op::Rem:
       case Op::Addi:
       case Op::Shl:
+      case Op::And:
+      case Op::Sra:
       case Op::Slt:
       case Op::Sgt:
       case Op::Sle:
@@ -1093,7 +1097,8 @@ class FunctionCompiler {
             continue;
           }
           const bool arithmetic = inst.op == Op::Add || inst.op == Op::Sub || inst.op == Op::Mul ||
-                                   inst.op == Op::Addi || inst.op == Op::Shl || inst.op == Op::Neg ||
+                                   inst.op == Op::Addi || inst.op == Op::Shl || inst.op == Op::And ||
+                                   inst.op == Op::Sra || inst.op == Op::Neg ||
                                    inst.op == Op::Li || inst.op == Op::Slt || inst.op == Op::Sgt ||
                                    inst.op == Op::Sle || inst.op == Op::Sge || inst.op == Op::Eq ||
                                    inst.op == Op::Ne || inst.op == Op::Seqz || inst.op == Op::Snez;
@@ -2194,6 +2199,55 @@ class FunctionCompiler {
     }
   }
 
+  // x % ±2^k 按向零截断展开。负数余数的符号跟被除数，不能直接 and。
+  void reduce_pow2_rem() {
+    for (Block& block : blocks_) {
+      std::vector<Inst> rebuilt;
+      for (const Inst& inst : block.insts) {
+        int32_t divisor = 0;
+        if (inst.dead || inst.op != Op::Rem || !get_const(inst.b, divisor) || divisor == 0 ||
+            divisor == 1 || divisor == -1) {
+          rebuilt.push_back(inst);
+          continue;
+        }
+        int32_t mag = divisor;
+        if (mag < 0) {
+          if (mag == INT32_MIN) {
+            rebuilt.push_back(inst);
+            continue;
+          }
+          mag = -mag;
+        }
+        if (mag < 2 || (mag & (mag - 1)) != 0) {
+          rebuilt.push_back(inst);
+          continue;
+        }
+        const int32_t mask_bits = mag - 1;
+        auto push = [&](Op op, int dst, int a, int b, int imm) {
+          Inst made;
+          made.op = op;
+          made.dst = dst;
+          made.a = a;
+          made.b = b;
+          made.imm = imm;
+          rebuilt.push_back(made);
+        };
+        const int mask_li = new_vreg();
+        push(Op::Li, mask_li, -1, -1, mask_bits);
+        const int sign = new_vreg();
+        push(Op::Sra, sign, inst.a, -1, 31);
+        const int mask = new_vreg();
+        push(Op::And, mask, sign, mask_li, 0);
+        const int biased = new_vreg();
+        push(Op::Add, biased, inst.a, mask, 0);
+        const int low = new_vreg();
+        push(Op::And, low, biased, mask_li, 0);
+        push(Op::Sub, inst.dst, low, mask, 0);
+      }
+      block.insts = std::move(rebuilt);
+    }
+  }
+
   // 同一基本块里，把只被加法使用的链收成系数和。模 2^32，只有指令变少才替换。
   void fold_linear_adds() {
     for (int block_index = 0; block_index < static_cast<int>(blocks_.size()); ++block_index) {
@@ -2949,6 +3003,7 @@ class FunctionCompiler {
     compute_dom();
     global_value_numbering();
     propagate_constants();
+    reduce_pow2_rem();
     rebuild_cfg();
     compute_dom();
     for (int pass = 0; pass < 4; ++pass) {
@@ -3819,6 +3874,17 @@ class FunctionCompiler {
       case Op::Shl: {
         const std::string lhs = load_vreg(out, inst.a, "t0");
         emit_result(out, "slliw", inst.dst, ", " + lhs + ", " + std::to_string(inst.imm));
+        break;
+      }
+      case Op::And: {
+        const std::string lhs = load_vreg(out, inst.a, "t0");
+        const std::string rhs = load_vreg(out, inst.b, "t1");
+        emit_result(out, "and", inst.dst, ", " + lhs + ", " + rhs);
+        break;
+      }
+      case Op::Sra: {
+        const std::string lhs = load_vreg(out, inst.a, "t0");
+        emit_result(out, "sraiw", inst.dst, ", " + lhs + ", " + std::to_string(inst.imm));
         break;
       }
       case Op::Sle:

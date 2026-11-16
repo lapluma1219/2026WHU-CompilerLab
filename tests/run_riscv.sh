@@ -85,6 +85,16 @@ int main() {
 }
 EOF
 run_case div "$tmp/div.c" /dev/null "-2-1" 0
+cat > "$tmp/rem2.c" << 'EOF'
+int main() {
+    putint((-5) % 4);
+    putint((-4) % 4);
+    putint((-3) % 8);
+    putint(6 % -4);
+    return 0;
+}
+EOF
+run_case rem2 "$tmp/rem2.c" /dev/null "-10-32" 0
 
 cat > "$tmp/cmp.c" << 'EOF'
 int main() {
