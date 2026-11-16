@@ -1,6 +1,6 @@
 # 2026WHU-CompilerLab
 
-ToyC 编译器的第 1 阶段：词法分析。当前只实现 `-token`。语法分析、语义分析和代码生成都还没有做。
+ToyC 编译器。第 1 阶段词法分析已在平台通过。第 2 阶段是语法分析和语义分析。代码生成还没有做。
 
 评测看标准输出。除了下面写明的命令行用法错误，程序不往 stdout 打印说明、日志或空头部。
 
@@ -28,11 +28,21 @@ cmake --build build
 ```bash
 echo "int a = 1;" | ./compiler -token > test.token
 ./compiler -token < test.c > test.token
+echo "int main() { int a; a = 1; return a; }" | ./compiler -ast > test.check-ast
+./compiler -ast < test.c > test.check-ast
 ```
 
-`-token` 从标准输入读完整份源程序。不读文件名参数。
+程序从标准输入读完整份源程序。一次只接受 `-token` 或 `-ast`。`-asm`、`-opt` 还没有实现，会在 stderr 提示并返回 2，stdout 为空。分析本身无论 `accept` 还是 `reject` 都返回 0。
 
-没有 `-token`，或者传入尚未实现的参数（包括 `-ast`、`-asm`、`-opt`），程序在 stderr 写一行用法并返回 2，stdout 为空。词法阶段发现非法字符时仍然返回 0；诊断写在 stdout 的 `reject` 块里。
+`-token` 的输出与已经验收的词法阶段相同。`-ast` 在没有错误时只输出 `accept`；有错误时输出 `reject` 和 0-based 行号。它不打印语法树。树在内部建立，语义分析使用它，供后面的代码生成和答辩查看结构。
+
+## 阶段一检查点
+
+平台词法成绩 100/100，30/30。对应提交：
+
+`57b262ef8becd948cc9b28aecb26382a6bd6c581`
+
+回退到该版本用 `git checkout 57b262ef8becd948cc9b28aecb26382a6bd6c581`。细节在 `docs/stage2.md`。
 
 ## 输出
 
@@ -134,6 +144,10 @@ echo "int a = 1;" | ./compiler -token > test.token
 
 这些测试只说明本地夹具和当前程序一致。它不等于课程平台 OJ 通过。
 
+## 变量初始化
+
+语义说明写每个变量声明必须带初始化。文法把 `'int' ID` 后面的 `'=' Expr` 写成可选，示例一包含 `int b;`，作业给出的 `-ast` 命令也使用 `int a;` 且不赋值前的声明。示例一的输出是 `accept`。实现允许 `int` 不初始化，`const int` 仍必须初始化。声明之后可以赋值再使用。不额外做“读取前必须已赋值”的分析。`int main(){ int a; return a; }` 因此也是 `accept`。
+
 ## 已知缺口
 
 阶段 1 页面快照里，注释的两条子列表是空的。补充格式没有再写注释文法。实现采用同一门语言在阶段 2/3 正文里写明的规则，以及作业参考文档：`//` 到最近换行前，`/*` 到最近的 `*/`。
@@ -146,7 +160,11 @@ echo "int a = 1;" | ./compiler -token > test.token
 
 只有诊断、没有任何 token 时，诊断块后面仍保留那个分隔空行。待核实。
 
-阶段 2 的“正则在原有基础上有扩充”没有说明扩充了什么。可见的 NUMBER 文本就是带 `-?` 的那一条；和样例冲突的处理见上一节。
+阶段 2 仍写“正则在原有基础上有扩充”，但没有说明扩充了什么。NUMBER 的可见文本仍是 `-?(0|[1-9][0-9]*)`。词法已按平台验收结果处理：负号单独成 token，连续数字合成一个 `IntConst`。
+
+`-ast` 尚未经过课程平台验收。本地通过不等于 OJ 通过。除数为常量 0 会拒绝，但短路左侧已能确定结果时不分析右侧。`const` 再次赋值会拒绝。这两点和返回路径的 `while` 判断见 `docs/stage2.md`。
+
+代码、测试和文档由仓库所有者使用 Cursor 云端代理（Grok）根据作业原文生成和修改。没有其他成员的提交记录，不能据此编写小组分工。AI 使用说明在 `docs/ai-usage.md`。
 
 ## 提交到平台时用的分支
 

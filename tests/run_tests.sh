@@ -41,7 +41,19 @@ for input in tests/cases/*.in; do
   ./compiler -token < "$input" > "$actual"
   status=$?
   set -e
-  check_stdout "$name" "$expected" "$actual" "$status"
+  check_stdout "token:$name" "$expected" "$actual" "$status"
+  rm -f "$actual"
+done
+
+for input in tests/ast/*.in; do
+  name="$(basename "${input%.in}")"
+  expected="${input%.in}.expected"
+  actual="$(mktemp)"
+  set +e
+  ./compiler -ast < "$input" > "$actual"
+  status=$?
+  set -e
+  check_stdout "ast:$name" "$expected" "$actual" "$status"
   rm -f "$actual"
 done
 
@@ -71,16 +83,25 @@ rm -f "$actual" "$err"
 actual="$(mktemp)"
 err="$(mktemp)"
 set +e
-echo 'int main(){return 0;}' | ./compiler -ast > "$actual" 2> "$err"
+echo 'int main(){return 0;}' | ./compiler -asm > "$actual" 2> "$err"
 status=$?
 set -e
 if [[ "$status" -eq 0 || -s "$actual" ]]; then
-  echo "FAIL -ast is stage 2 and must not write tokens (exit=$status)"
+  echo "FAIL -asm is stage 3 and must not write stdout (exit=$status)"
   fail=$((fail + 1))
 else
-  echo "PASS cli-rejects-ast"
+  echo "PASS cli-rejects-asm"
   pass=$((pass + 1))
 fi
+rm -f "$actual" "$err"
+
+actual="$(mktemp)"
+set +e
+echo 'int main() { int a; a = 1; return a; }' | ./compiler -ast > "$actual"
+status=$?
+set -e
+printf 'accept\n' > "$err"
+check_stdout "ast-echo-uninit" "$err" "$actual" "$status"
 rm -f "$actual" "$err"
 
 loc_bin="tests/lexer_locations_test"
@@ -95,6 +116,21 @@ if [[ "$status" -ne 0 ]]; then
   fail=$((fail + 1))
 else
   echo "PASS lexer-locations"
+  pass=$((pass + 1))
+fi
+
+shape_bin="tests/ast_shape_test"
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Isrc -o "$shape_bin" \
+  tests/ast_shape.cpp src/lexer/lexer.cpp src/lexer/token.cpp src/parser/parser.cpp src/sema/sema.cpp
+set +e
+"./$shape_bin"
+status=$?
+set -e
+if [[ "$status" -ne 0 ]]; then
+  echo "FAIL ast-shape"
+  fail=$((fail + 1))
+else
+  echo "PASS ast-shape"
   pass=$((pass + 1))
 fi
 

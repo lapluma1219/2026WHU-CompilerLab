@@ -21,7 +21,9 @@
 make test
 ```
 
-数字串修正后重新执行 `make test`，结果：`36 passed, 0 failed`。其中 32 个是 `tests/cases/*.in` 的 stdout 字节比较，另外 4 项是：
+阶段 2 加入语法和语义之后重新执行 `make test`。词法夹具仍全部通过。`-ast` 夹具覆盖作业示例一 `accept`、示例二的 5 个行号、未初始化 `int`、作用域、函数、返回路径、循环和常量除零。本次结果：`78 passed, 0 failed`。同一源码用 CMake 构建成功，`./build/compiler -ast` 对 `int main() { int a; a = 1; return a; }` 输出 `accept`。
+
+阶段 1 数字修正当时的 `make test` 是 `36 passed, 0 failed`。其中 32 个是 `tests/cases/*.in` 的 stdout 字节比较，另外 4 项是：
 
 - `echo "int a = 1;" | ./compiler -token` 与 `stdin_example` 的期望一致
 - 不带 `-token` 时返回非 0，stdout 为空

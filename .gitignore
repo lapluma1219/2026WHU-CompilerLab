@@ -1,6 +1,7 @@
 compiler
 build/
 tests/lexer_locations_test
+tests/ast_shape_test
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake

@@ -1,8 +1,14 @@
 #include "lexer/lexer.hpp"
+#include "parser/parser.hpp"
+#include "sema/sema.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -26,26 +32,66 @@ void print_result(const toyc::LexResult& result) {
   }
 }
 
+void print_ast_result(std::vector<toyc::Diagnostic> diagnostics) {
+  std::stable_sort(diagnostics.begin(), diagnostics.end(),
+                   [](const toyc::Diagnostic& lhs, const toyc::Diagnostic& rhs) {
+                     if (lhs.line != rhs.line) {
+                       return lhs.line < rhs.line;
+                     }
+                     return lhs.column < rhs.column;
+                   });
+  if (diagnostics.empty()) {
+    std::cout << "accept\n";
+    return;
+  }
+  std::cout << "reject\n";
+  for (const toyc::Diagnostic& diagnostic : diagnostics) {
+    std::cout << diagnostic.line << ' ' << diagnostic.message << '\n';
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   bool token_mode = false;
+  bool ast_mode = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "-token") {
       token_mode = true;
       continue;
     }
+    if (arg == "-ast") {
+      ast_mode = true;
+      continue;
+    }
     std::cerr << "unsupported argument: " << arg << '\n';
-    std::cerr << "usage: compiler -token < input\n";
+    std::cerr << "usage: compiler -token|-ast < input\n";
     return 2;
   }
-  if (!token_mode) {
-    std::cerr << "usage: compiler -token < input\n";
+  if (token_mode == ast_mode) {
+    std::cerr << "usage: compiler -token|-ast < input\n";
     return 2;
   }
 
   toyc::Lexer lexer(read_stdin());
-  print_result(lexer.tokenize());
+  const toyc::LexResult lex = lexer.tokenize();
+  if (token_mode) {
+    print_result(lex);
+    return 0;
+  }
+
+  std::vector<toyc::Diagnostic> syntax;
+  toyc::Parser parser(lex.tokens, syntax);
+  // 树只留在内存里供语义分析和后续代码生成使用，-ast 不打印树。
+  std::unique_ptr<toyc::CompUnit> unit = parser.parse();
+  std::vector<toyc::Diagnostic> semantic;
+  if (unit) {
+    toyc::analyze(*unit, semantic);
+  }
+  std::vector<toyc::Diagnostic> all = lex.diagnostics;
+  all.insert(all.end(), syntax.begin(), syntax.end());
+  all.insert(all.end(), semantic.begin(), semantic.end());
+  print_ast_result(std::move(all));
   return 0;
 }

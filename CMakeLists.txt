@@ -18,6 +18,8 @@ add_executable(compiler
   src/main.cpp
   src/lexer/lexer.cpp
   src/lexer/token.cpp
+  src/parser/parser.cpp
+  src/sema/sema.cpp
 )
 target_include_directories(compiler PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(compiler PRIVATE -Wall -Wextra -Wpedantic)
