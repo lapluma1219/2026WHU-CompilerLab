@@ -591,7 +591,10 @@ class AsmEmitter {
 }  // namespace
 
 std::string emit_asm(const CompUnit& unit, bool optimize) {
-  AsmEmitter emitter(optimize);
+  if (optimize) {
+    return emit_optimized_asm(unit);
+  }
+  AsmEmitter emitter(false);
   return emitter.emit(unit);
 }
 

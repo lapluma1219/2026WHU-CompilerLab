@@ -101,7 +101,7 @@ set +e
 echo 'int main(){return 1;}' | ./compiler -opt -asm > "$actual" 2> "$err"
 status=$?
 set -e
-if [[ "$status" -ne 0 ]] || ! grep -q 'li t0, 1' "$actual"; then
+if [[ "$status" -ne 0 ]] || ! grep -Eq 'li[[:space:]]+[a-z0-9]+,[[:space:]]*1' "$actual"; then
   echo "FAIL -asm -opt should accept the optimization flag"
   fail=$((fail + 1))
 else

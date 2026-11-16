@@ -23,7 +23,11 @@ make test
 
 阶段 2 第一次平台结果是 92/100，`s04_unclosed_block` 和 `s05_while_without_condition` 为错误输出。修正错误恢复后重新执行 `make test`。词法夹具、示例一、示例二和原有语义夹具仍通过；新增未闭合块（有无末尾换行、嵌套、内层先闭合）和 `while` 缺条件（空括号、缺括号、缺右括号、后面还有别的错误）。具体行号规则见 `docs/stage2.md`。`s04_unclosed_block` 已在平台通过。针对 `s05_while_without_condition` 的回归之后，`make test` 曾为 `101 passed, 0 failed`。
 
-第三阶段加入 `-asm` / `-opt` 后，`tests/run_riscv.sh` 用 `riscv64-linux-gnu-gcc -march=rv64gc -mabi=lp64d -nostdlib -static` 链接 `tests/runtime/libtoyc.s`，再用 `qemu-riscv64-static` 比较 `-asm` 与 `-asm -opt` 的标准输出和退出码。覆盖返回值、`putint`/`getint`、负数除模、比较短路、递归、10 个参数、嵌套 `break`/`continue`、32 位溢出和综合样例。本次完整 `make test`：`104 passed, 0 failed`。CMake 对同一批源码构建成功。
+第三阶段 `-asm` 仍走原来的栈槽后端。`-asm -opt` 先建 SSA，再做常量传播、死代码删除、GVN、循环不变量外提、归纳变量强度削减、小函数内联、尾递归和寄存器分配。课程说明写明性能样例调用的是 `-asm -opt`，所以优化放在这条路径上。
+
+`tests/run_riscv.sh` 用 `riscv64-linux-gnu-gcc -march=rv64gc -mabi=lp64d -nostdlib -static` 链接 `tests/runtime/libtoyc.s`，再用 `qemu-riscv64-static` 比较两种模式。除了原先的返回值、输入输出、负数除模、短路、递归、10 个参数、嵌套循环和综合样例外，又加了死代码循环、循环不变量、`i * 3`、尾递归、内联、调用顺序、循环内 `if` 和 30 个局部变量。`-asm` 与 `-asm -opt` 的标准输出和退出码一致。本次完整 `make test`：`104 passed, 0 failed`。CMake 对同一批源码构建成功。
+
+本地微基准（不是平台隐藏用例）是一个带无用乘方的计数循环，`bash tests/bench_opt.sh 100000000`：`-asm` 871 ms，`-asm -opt` 110 ms，输出都是 `300000000`。同一程序的 `gcc -O2` 在 QEMU 里是 8 ms，因为它把循环收成了乘法；平台上 `p01` 的 GCC 时间仍是数百毫秒，说明隐藏用例没有被收成常数时间。优化后的循环本体是比较、两条 `addiw` 和一条跳转，无用乘法已经删掉。
 
 阶段 1 数字修正当时的 `make test` 是 `36 passed, 0 failed`。其中 32 个是 `tests/cases/*.in` 的 stdout 字节比较，另外 4 项是：
 

@@ -197,6 +197,126 @@ EOF
 # putint 不换行，依次输出 16..6、4、3、2，最后 c 为 1。
 run_case sample "$tmp/sample.c" /dev/null "161514131211109876432" 1
 
+cat > "$tmp/iv.c" << 'EOF'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 10) {
+        s = s + i * 3;
+        i = i + 1;
+    }
+    return s;
+}
+EOF
+run_case iv "$tmp/iv.c" /dev/null "" 135
+
+cat > "$tmp/licm.c" << 'EOF'
+int main() {
+    int n = 20;
+    int a = 6;
+    int b = 7;
+    int i = 0;
+    int s = 0;
+    while (i < n) {
+        s = s + a * b;
+        i = i + 1;
+    }
+    putint(s);
+    return 0;
+}
+EOF
+run_case licm "$tmp/licm.c" /dev/null "840" 0
+
+cat > "$tmp/dead.c" << 'EOF'
+int main() {
+    int n = 50;
+    int x = 3;
+    int y = 5;
+    int i = 0;
+    int s = 0;
+    while (i < n) {
+        int d1 = i * x + y;
+        int d2 = d1 * d1;
+        s = s + x;
+        i = i + 1;
+    }
+    putint(s);
+    return 0;
+}
+EOF
+run_case dead "$tmp/dead.c" /dev/null "150" 0
+
+cat > "$tmp/tail.c" << 'EOF'
+int down(int n, int acc) {
+    if (n <= 0) return acc;
+    return down(n - 1, acc + 1);
+}
+int main() {
+    putint(down(20, 0));
+    return 0;
+}
+EOF
+run_case tail "$tmp/tail.c" /dev/null "20" 0
+
+cat > "$tmp/inl.c" << 'EOF'
+int inc(int x) { return x + 1; }
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 5) {
+        s = inc(s);
+        i = i + 1;
+    }
+    return s;
+}
+EOF
+run_case inl "$tmp/inl.c" /dev/null "" 5
+
+cat > "$tmp/order.c" << 'EOF'
+int a() { putint(1); return 1; }
+int b() { putint(2); return 2; }
+int add(int x, int y) { return x + y; }
+int main() { putint(add(a(), b())); return 0; }
+EOF
+run_case order "$tmp/order.c" /dev/null "123" 0
+
+cat > "$tmp/short2.c" << 'EOF'
+int side() { putint(9); return 1; }
+int main() {
+    if (0 && side()) putint(8);
+    if (1 || side()) putint(4);
+    return 0;
+}
+EOF
+run_case short2 "$tmp/short2.c" /dev/null "4" 0
+
+cat > "$tmp/unsw.c" << 'EOF'
+int main() {
+    int flag = 0;
+    int i = 0;
+    while (i < 3) {
+        if (flag) putint(1);
+        else putint(2);
+        i = i + 1;
+    }
+    return 0;
+}
+EOF
+run_case unsw "$tmp/unsw.c" /dev/null "222" 0
+
+cat > "$tmp/many.c" << 'EOF'
+int main() {
+    int a1=1; int a2=2; int a3=3; int a4=4; int a5=5;
+    int a6=6; int a7=7; int a8=8; int a9=9; int a10=10;
+    int b1=11; int b2=12; int b3=13; int b4=14; int b5=15;
+    int b6=16; int b7=17; int b8=18; int b9=19; int b10=20;
+    int c1=21; int c2=22; int c3=23; int c4=24; int c5=25;
+    int c6=26; int c7=27; int c8=28; int c9=29; int c10=30;
+    return a1+a2+a3+a4+a5+a6+a7+a8+a9+a10+b1+b2+b3+b4+b5+b6+b7+b8+b9+b10+c1+c2+c3+c4+c5+c6+c7+c8+c9+c10;
+}
+EOF
+run_case many "$tmp/many.c" /dev/null "" 209
+
 rm -rf "$tmp"
 if [[ "$fail" -ne 0 ]]; then
   exit 1

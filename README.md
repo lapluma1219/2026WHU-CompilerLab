@@ -42,7 +42,7 @@ riscv64-linux-gnu-gcc -march=rv64gc -mabi=lp64d -nostdlib -static -no-pie \
 qemu-riscv64 ./test
 ```
 
-`-asm` 按现有语法树生成 RV64GC 汇编。整数运算使用 32 位指令。`-opt` 在结果不变的前提下做常量折叠、加乘的简单化简，以及 `return` 之后直线代码的删除。课程评测链接的是自己的 `libtoyc.a`；`tests/runtime/libtoyc.s` 只给本地 QEMU 使用，`putint` 不附加换行。
+`-asm` 按现有语法树生成 RV64GC 汇编，整数运算使用 32 位指令。`-asm -opt` 在同一棵树上做常量传播、死代码删除、公共子表达式、循环不变量外提、乘加的强度削减、小函数内联、尾递归和寄存器分配。课程说明里的性能样例使用 `-asm -opt`。课程评测链接的是自己的 `libtoyc.a`；`tests/runtime/libtoyc.s` 只给本地 QEMU 使用，`putint` 不附加换行。
 
 `-token` 的输出与已经验收的词法阶段相同。`-ast` 在没有错误时只输出 `accept`；有错误时输出 `reject` 和 0-based 行号。它不打印语法树。树在内部建立，语义分析使用它，供后面的代码生成和答辩查看结构。
 

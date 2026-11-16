@@ -21,6 +21,7 @@ add_executable(compiler
   src/parser/parser.cpp
   src/sema/sema.cpp
   src/codegen/codegen.cpp
+  src/codegen/optimize.cpp
 )
 target_include_directories(compiler PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(compiler PRIVATE -Wall -Wextra -Wpedantic)
