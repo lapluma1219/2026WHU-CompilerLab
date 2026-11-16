@@ -25,7 +25,9 @@ make test
 
 第三阶段 `-asm` 仍走原来的栈槽后端。`-asm -opt` 先建 SSA，再做常量传播、死代码删除、GVN、循环不变量外提、归纳变量强度削减、小函数内联、尾递归和寄存器分配。课程说明写明性能样例调用的是 `-asm -opt`，所以优化放在这条路径上。
 
-`tests/run_riscv.sh` 用 `riscv64-linux-gnu-gcc -march=rv64gc -mabi=lp64d -nostdlib -static` 链接 `tests/runtime/libtoyc.s`，再用 `qemu-riscv64-static` 比较两种模式。除了原先的返回值、输入输出、负数除模、短路、递归、10 个参数、嵌套循环和综合样例外，又加了死代码循环、循环不变量、`i * 3`、尾递归、内联、调用顺序、循环内 `if` 和 30 个局部变量。`-asm` 与 `-asm -opt` 的标准输出和退出码一致。本次完整 `make test`：`104 passed, 0 failed`。CMake 对同一批源码构建成功。
+`26f56d5` 在平台上功能仍是 100/100，但性能有 12 个输入算错或编译器段错误。根因有两处，都在 `-opt` 的 SSA 构造里：给 phi 填前驱时递归创建新 phi，`phis_` 扩容后仍往旧内存写边，短路较多的控制流会直接段错误，写坏时则把循环值收成和迭代次数无关的结果；循环外提 `if` 时，没有 else 的分支没有生成另一份循环，`if (不变条件) break` 后面的语句在条件为假时被整段丢掉。死代码删除和寄存器分配还保留着，无用乘法不会回到循环里。
+
+`tests/run_riscv.sh` 用 `riscv64-linux-gnu-gcc -march=rv64gc -mabi=lp64d -nostdlib -static` 链接 `tests/runtime/libtoyc.s`，再用 `qemu-riscv64-static` 比较两种模式。除了原先的返回值、输入输出、负数除模、短路、递归、10 个参数、嵌套循环和综合样例外，又加了死代码循环、循环不变量、`i * 3`、尾递归、内联、调用顺序、循环内 `if` 和 30 个局部变量。`-asm` 与 `-asm -opt` 的标准输出和退出码一致。本轮又加了带 `break` 的循环、条件和分支里的短路、循环内 `if` 的两个方向，以及 `tests/fuzz_opt.py` 用种子 11 生成的 30 个随机程序。ASAN/UBSAN 构建下另外跑过 50 加 80 个随机程序，没有再出现段错误或结果不一致。本次完整 `make test`：`104 passed, 0 failed`。CMake 对同一批源码构建成功。
 
 本地微基准（不是平台隐藏用例）是一个带无用乘方的计数循环，`bash tests/bench_opt.sh 100000000`：`-asm` 871 ms，`-asm -opt` 110 ms，输出都是 `300000000`。同一程序的 `gcc -O2` 在 QEMU 里是 8 ms，因为它把循环收成了乘法；平台上 `p01` 的 GCC 时间仍是数百毫秒，说明隐藏用例没有被收成常数时间。优化后的循环本体是比较、两条 `addiw` 和一条跳转，无用乘法已经删掉。
 

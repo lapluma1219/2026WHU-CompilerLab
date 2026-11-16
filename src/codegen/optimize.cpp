@@ -509,6 +509,39 @@ class FunctionCompiler {
     seal(entry_bb_);
     simplify_phis();
     pop_scope();
+    if (std::getenv("TOYC_DUMP")) {
+      dump_ir("after-build");
+    }
+  }
+
+  void dump_ir(const char* tag) const {
+    std::cerr << "---- " << func_.name << ' ' << tag << " ----\n";
+    for (int i = 0; i < static_cast<int>(phis_.size()); ++i) {
+      const Phi& phi = phis_[static_cast<std::size_t>(i)];
+      if (phi.dead) {
+        continue;
+      }
+      std::cerr << "phi b" << phi.block << " v" << resolve(phi.dst) << " =";
+      for (const auto& incoming : phi.incoming) {
+        std::cerr << " b" << incoming.first << ":v" << resolve(incoming.second);
+      }
+      std::cerr << '\n';
+    }
+    for (int block = 0; block < static_cast<int>(blocks_.size()); ++block) {
+      std::cerr << "b" << block << " preds";
+      for (int pred : blocks_[static_cast<std::size_t>(block)].preds) {
+        std::cerr << ' ' << pred;
+      }
+      std::cerr << '\n';
+      for (const Inst& inst : blocks_[static_cast<std::size_t>(block)].insts) {
+        if (inst.dead) {
+          continue;
+        }
+        std::cerr << "  op" << static_cast<int>(inst.op) << " d" << inst.dst << " a" << inst.a
+                  << " b" << inst.b << " imm" << inst.imm << " t" << inst.true_bb << " f"
+                  << inst.false_bb << '\n';
+      }
+    }
   }
 
   void rebuild_cfg() {
@@ -1415,6 +1448,9 @@ class FunctionCompiler {
       cur_ = -1;
     }
     rebuild_cfg();
+    if (std::getenv("TOYC_DUMP")) {
+      dump_ir("after-opt");
+    }
   }
 
   void sequentialize(std::vector<std::pair<int, int>> moves, int block) {
@@ -2054,11 +2090,15 @@ int FunctionCompiler::add_phi_operands(int var, int block, int phi_dst) {
   if (phi_index < 0) {
     return phi_dst;
   }
-  Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
-  phi.incoming.clear();
-  for (int pred : blocks_[static_cast<std::size_t>(block)].preds) {
-    phi.incoming.push_back({pred, read_variable(var, pred)});
+  // 读前驱时会递归创建新的 phi。不能拿 phis_ 里的引用跨过这次调用，
+  // 否则 vector 扩容后写入的是已释放的 incoming。
+  const std::vector<int> preds = blocks_[static_cast<std::size_t>(block)].preds;
+  std::vector<std::pair<int, int>> incoming;
+  incoming.reserve(preds.size());
+  for (int pred : preds) {
+    incoming.push_back({pred, read_variable(var, pred)});
   }
+  phis_[static_cast<std::size_t>(phi_index)].incoming = std::move(incoming);
   return try_remove_phi(phi_index);
 }
 
@@ -2250,33 +2290,27 @@ void FunctionCompiler::emit_while(const WhileStmt& stmt, bool allow_unswitch) {
     if (const IfStmt* split = find_unswitch_if(stmt)) {
       const int cond = split->cond ? eval_expr(*split->cond) : zero_vreg_;
       const int then_bb = new_block();
-      const int else_bb = split->else_stmt ? new_block() : -1;
+      const int else_bb = new_block();
       const int join = new_block();
-      emit_branch(cond, then_bb, split->else_stmt ? else_bb : join);
-      seal(then_bb);
-      cur_ = then_bb;
+      emit_branch(cond, then_bb, else_bb);
       const IfStmt* saved = unswitch_skip_;
       const bool saved_side = unswitch_then_;
-      unswitch_skip_ = split;
-      unswitch_then_ = true;
-      emit_while(stmt, false);
-      unswitch_skip_ = saved;
-      unswitch_then_ = saved_side;
-      if (cur_ >= 0) {
-        emit_jump(join);
-      }
-      if (split->else_stmt) {
-        seal(else_bb);
-        cur_ = else_bb;
+      auto emit_side = [&](int block, bool take_then) {
+        seal(block);
+        cur_ = block;
         unswitch_skip_ = split;
-        unswitch_then_ = false;
+        unswitch_then_ = take_then;
         emit_while(stmt, false);
         unswitch_skip_ = saved;
         unswitch_then_ = saved_side;
         if (cur_ >= 0) {
           emit_jump(join);
         }
-      }
+      };
+      // 没有 else 时也要留下另一份循环，只是那个 if 变成空语句。
+      // 否则 if (不变条件) break; 后面的语句会在条件为假时被整段丢掉。
+      emit_side(then_bb, true);
+      emit_side(else_bb, false);
       if (!blocks_[static_cast<std::size_t>(join)].preds.empty()) {
         seal(join);
         cur_ = join;

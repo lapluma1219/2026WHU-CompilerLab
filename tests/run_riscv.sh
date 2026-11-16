@@ -317,7 +317,81 @@ int main() {
 EOF
 run_case many "$tmp/many.c" /dev/null "" 209
 
+# break 在循环里时，后面的赋值必须还能带到循环出口。
+cat > "$tmp/breakloop.c" << 'EOF'
+int main() {
+    int n = getint();
+    int a = getint();
+    int guard = 0;
+    while (guard < 3) {
+        if (!a) break;
+        n = -3 + a;
+        guard = guard + 1;
+    }
+    putint(n);
+    return 0;
+}
+EOF
+printf '3 1\n' > "$tmp/breakloop.in"
+run_case breakloop "$tmp/breakloop.c" "$tmp/breakloop.in" "-2" 0
+
+# 循环条件和分支里的短路不能让编译器崩溃，并且要保留副作用。
+cat > "$tmp/shortloop.c" << 'EOF'
+int main() {
+    int n = getint();
+    int a = getint();
+    int b = getint();
+    int i = 0;
+    int s = 0;
+    while (i < n && (a > 0 || b < i)) {
+        if (i < a && b > 0 || s < i && a > 0) {
+            s = s + i + b;
+        } else {
+            s = s + a;
+        }
+        i = i + 1;
+    }
+    putint(s);
+    return a;
+}
+EOF
+printf '8 3 4\n' > "$tmp/shortloop.in"
+run_case shortloop "$tmp/shortloop.c" "$tmp/shortloop.in" "30" 3
+printf '8 0 4\n' > "$tmp/shortzero.in"
+run_case shortzero "$tmp/shortloop.c" "$tmp/shortzero.in" "0" 0
+
+# 循环内不变的 if 走两个方向，结果都要跟着迭代次数变。
+cat > "$tmp/unsw2.c" << 'EOF'
+int main() {
+    int n = getint();
+    int a = getint();
+    int b = getint();
+    int i = 0;
+    int s = 0;
+    while (i < n) {
+        if (a < b) {
+            s = s + i;
+        } else {
+            s = s + 1;
+        }
+        i = i + 1;
+    }
+    putint(s);
+    return s;
+}
+EOF
+printf '6 1 4\n' > "$tmp/unsw2a.in"
+run_case unswa "$tmp/unsw2.c" "$tmp/unsw2a.in" "15" 15
+printf '6 9 2\n' > "$tmp/unsw2b.in"
+run_case unswb "$tmp/unsw2.c" "$tmp/unsw2b.in" "6" 6
+
 rm -rf "$tmp"
+if ! python3 tests/fuzz_opt.py ./compiler 11 30; then
+  echo "FAIL opt-fuzz"
+  fail=1
+else
+  echo "OK opt-fuzz"
+fi
 if [[ "$fail" -ne 0 ]]; then
   exit 1
 fi
