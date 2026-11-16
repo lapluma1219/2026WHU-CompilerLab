@@ -30,6 +30,7 @@ enum class Op {
   Shl,
   And,
   Sra,
+  Mulh,
   Slt,
   Sgt,
   Sle,
@@ -135,6 +136,92 @@ bool expr_side_effect(const Expr& expr) {
     }
     default:
       return false;
+  }
+}
+
+bool is_int_lit(const Expr* expr, int32_t& value) {
+  if (!expr || expr->kind != ExprKind::IntLit) {
+    return false;
+  }
+  value = 0;
+  try {
+    value = static_cast<int32_t>(std::stol(static_cast<const IntLitExpr*>(expr)->lexeme, nullptr, 10));
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
+
+bool trivial_identity(const std::string& name, const Expr* expr) {
+  if (!expr) {
+    return false;
+  }
+  if (expr->kind == ExprKind::Var) {
+    return static_cast<const VarExpr*>(expr)->name == name;
+  }
+  if (expr->kind != ExprKind::Binary) {
+    return false;
+  }
+  const auto& node = static_cast<const BinaryExprNode&>(*expr);
+  int32_t lit = 0;
+  const bool left_self = node.lhs && node.lhs->kind == ExprKind::Var &&
+                         static_cast<const VarExpr*>(node.lhs.get())->name == name;
+  const bool right_self = node.rhs && node.rhs->kind == ExprKind::Var &&
+                          static_cast<const VarExpr*>(node.rhs.get())->name == name;
+  const bool left_lit = is_int_lit(node.lhs.get(), lit);
+  const bool right_lit = is_int_lit(node.rhs.get(), lit);
+  if (node.op == TokenKind::Plus) {
+    return (left_self && right_lit && lit == 0) || (right_self && left_lit && lit == 0);
+  }
+  if (node.op == TokenKind::Minus) {
+    return left_self && right_lit && lit == 0;
+  }
+  if (node.op == TokenKind::Star || node.op == TokenKind::Slash) {
+    return (left_self && right_lit && lit == 1) ||
+           (node.op == TokenKind::Star && right_self && left_lit && lit == 1);
+  }
+  return false;
+}
+
+int useful_nodes(const Stmt& stmt) {
+  switch (stmt.kind) {
+    case StmtKind::Empty:
+      return 0;
+    case StmtKind::ExprStmt: {
+      const auto& node = static_cast<const ExprStmtNode&>(stmt);
+      return node.expr && expr_side_effect(*node.expr) ? 1 : 0;
+    }
+    case StmtKind::Assign: {
+      const auto& node = static_cast<const AssignStmt&>(stmt);
+      if (trivial_identity(node.name, node.expr.get())) {
+        return 0;
+      }
+      return 1;
+    }
+    case StmtKind::Block: {
+      int count = 0;
+      for (const auto& child : static_cast<const BlockStmt&>(stmt).stmts) {
+        count += useful_nodes(*child);
+      }
+      return count;
+    }
+    case StmtKind::If: {
+      const auto& node = static_cast<const IfStmt&>(stmt);
+      int count = 1;
+      if (node.then_stmt) {
+        count += useful_nodes(*node.then_stmt);
+      }
+      if (node.else_stmt) {
+        count += useful_nodes(*node.else_stmt);
+      }
+      return count;
+    }
+    case StmtKind::While: {
+      const auto& node = static_cast<const WhileStmt&>(stmt);
+      return 1 + (node.body ? useful_nodes(*node.body) : 0);
+    }
+    default:
+      return 1;
   }
 }
 
@@ -954,6 +1041,7 @@ class FunctionCompiler {
       case Op::Shl:
       case Op::And:
       case Op::Sra:
+      case Op::Mulh:
       case Op::Slt:
       case Op::Sgt:
       case Op::Sle:
@@ -1098,7 +1186,7 @@ class FunctionCompiler {
           }
           const bool arithmetic = inst.op == Op::Add || inst.op == Op::Sub || inst.op == Op::Mul ||
                                    inst.op == Op::Addi || inst.op == Op::Shl || inst.op == Op::And ||
-                                   inst.op == Op::Sra || inst.op == Op::Neg ||
+                                   inst.op == Op::Sra || inst.op == Op::Mulh || inst.op == Op::Neg ||
                                    inst.op == Op::Li || inst.op == Op::Slt || inst.op == Op::Sgt ||
                                    inst.op == Op::Sle || inst.op == Op::Sge || inst.op == Op::Eq ||
                                    inst.op == Op::Ne || inst.op == Op::Seqz || inst.op == Op::Snez;
@@ -2199,8 +2287,366 @@ class FunctionCompiler {
     }
   }
 
+  struct SignedDivMagic {
+    int32_t magic = 0;
+    uint8_t more = 0;
+  };
+
+  static SignedDivMagic signed_div_magic(int32_t divisor) {
+    SignedDivMagic result;
+    const uint32_t ud = static_cast<uint32_t>(divisor);
+    const uint32_t abs_d = divisor < 0 ? (0u - ud) : ud;
+    const uint32_t floor = 31u - static_cast<uint32_t>(__builtin_clz(abs_d));
+    if ((abs_d & (abs_d - 1u)) == 0u) {
+      result.more = static_cast<uint8_t>(floor | (divisor < 0 ? 0x80u : 0u));
+      return result;
+    }
+    auto div64 = [](uint32_t hi, uint32_t lo, uint32_t den, uint32_t& rem) {
+      const uint64_t n = (static_cast<uint64_t>(hi) << 32) | lo;
+      const uint32_t quot = static_cast<uint32_t>(n / den);
+      rem = static_cast<uint32_t>(n - static_cast<uint64_t>(quot) * den);
+      return quot;
+    };
+    uint32_t rem = 0;
+    uint32_t proposed = div64(1u << (floor - 1u), 0, abs_d, rem);
+    const uint32_t gap = abs_d - rem;
+    uint8_t more = 0;
+    if (gap < (1u << floor)) {
+      more = static_cast<uint8_t>(floor - 1u);
+    } else {
+      proposed += proposed;
+      const uint32_t twice = rem + rem;
+      if (twice >= abs_d || twice < rem) {
+        proposed += 1u;
+      }
+      more = static_cast<uint8_t>(floor | 0x40u);
+    }
+    proposed += 1u;
+    int32_t magic = static_cast<int32_t>(proposed);
+    if (divisor < 0) {
+      more = static_cast<uint8_t>(more | 0x80u);
+      magic = static_cast<int32_t>(0u - static_cast<uint32_t>(magic));
+    }
+    result.magic = magic;
+    result.more = more;
+    return result;
+  }
+
+  // 同一被除数和除数的余数改成 x - quot * d，省掉第二条 remw。
+  void fuse_div_rem() {
+    rebuild_cfg();
+    compute_dom();
+    struct DivSite {
+      int block = -1;
+      int index = -1;
+      int dst = -1;
+      int a = -1;
+      int b = -1;
+    };
+    std::vector<DivSite> divs;
+    for (int block = 0; block < static_cast<int>(blocks_.size()); ++block) {
+      const auto& insts = blocks_[static_cast<std::size_t>(block)].insts;
+      for (int index = 0; index < static_cast<int>(insts.size()); ++index) {
+        const Inst& inst = insts[static_cast<std::size_t>(index)];
+        if (inst.dead || inst.op != Op::Div) {
+          continue;
+        }
+        DivSite site;
+        site.block = block;
+        site.index = index;
+        site.dst = resolve(inst.dst);
+        site.a = resolve(inst.a);
+        site.b = resolve(inst.b);
+        divs.push_back(site);
+      }
+    }
+    for (int block = 0; block < static_cast<int>(blocks_.size()); ++block) {
+      auto& insts = blocks_[static_cast<std::size_t>(block)].insts;
+      for (int index = 0; index < static_cast<int>(insts.size()); ++index) {
+        Inst& inst = insts[static_cast<std::size_t>(index)];
+        if (inst.dead || inst.op != Op::Rem) {
+          continue;
+        }
+        const int a = resolve(inst.a);
+        const int b = resolve(inst.b);
+        int quot = -1;
+        for (const DivSite& site : divs) {
+          if (site.a != a || site.b != b || site.dst < 0) {
+            continue;
+          }
+          const bool earlier = site.block == block && site.index < index;
+          const bool dominates_here = site.block != block && dominates(site.block, block);
+          if (earlier || dominates_here) {
+            quot = site.dst;
+          }
+        }
+        if (quot < 0) {
+          continue;
+        }
+        const int rem_dst = inst.dst;
+        const int prod = new_vreg();
+        Inst mul;
+        mul.op = Op::Mul;
+        mul.dst = prod;
+        mul.a = quot;
+        mul.b = b;
+        inst = mul;
+        Inst sub;
+        sub.op = Op::Sub;
+        sub.dst = rem_dst;
+        sub.a = a;
+        sub.b = prod;
+        insts.insert(insts.begin() + index + 1, sub);
+        for (DivSite& site : divs) {
+          if (site.block == block && site.index > index) {
+            ++site.index;
+          }
+        }
+        ++index;
+      }
+    }
+  }
+
+  void append_inst(std::vector<Inst>& out, Op op, int dst, int a, int b, int imm) {
+    Inst made;
+    made.op = op;
+    made.dst = dst;
+    made.a = a;
+    made.b = b;
+    made.imm = imm;
+    out.push_back(made);
+  }
+
+  // 常数除法用 32 位有符号乘法的高 32 位。±2^k 用移位。向零截断，INT_MIN / -1 得到 INT_MIN。
+  void append_signed_quot(std::vector<Inst>& out, int dividend, int32_t divisor, int dst) {
+    const SignedDivMagic magic = signed_div_magic(divisor);
+    const int shift = magic.more & 31;
+    const bool neg_div = (magic.more & 0x80) != 0;
+    if (magic.magic == 0) {
+      int current = dividend;
+      const int32_t mask_bits = shift == 0 ? 0 : static_cast<int32_t>((1u << static_cast<unsigned>(shift)) - 1u);
+      if (mask_bits != 0) {
+        const int mask = new_vreg();
+        append_inst(out, Op::Li, mask, -1, -1, mask_bits);
+        const int sign = new_vreg();
+        append_inst(out, Op::Sra, sign, dividend, -1, 31);
+        const int bias = new_vreg();
+        append_inst(out, Op::And, bias, sign, mask, 0);
+        const int sum = new_vreg();
+        append_inst(out, Op::Add, sum, dividend, bias, 0);
+        current = new_vreg();
+        append_inst(out, Op::Sra, current, sum, -1, shift);
+      }
+      if (neg_div) {
+        append_inst(out, Op::Neg, dst, current, -1, 0);
+      } else if (current != dividend) {
+        out.back().dst = dst;
+      } else {
+        append_inst(out, Op::Mov, dst, dividend, -1, 0);
+      }
+      return;
+    }
+    const int factor = new_vreg();
+    append_inst(out, Op::Li, factor, -1, -1, magic.magic);
+    int current = new_vreg();
+    append_inst(out, Op::Mulh, current, dividend, factor, 0);
+    if ((magic.more & 0x40) != 0) {
+      const int next = new_vreg();
+      append_inst(out, neg_div ? Op::Sub : Op::Add, next, current, dividend, 0);
+      current = next;
+    }
+    if (shift != 0) {
+      const int next = new_vreg();
+      append_inst(out, Op::Sra, next, current, -1, shift);
+      current = next;
+    }
+    const int neg = new_vreg();
+    append_inst(out, Op::Slt, neg, current, zero_vreg_, 0);
+    append_inst(out, Op::Add, dst, current, neg, 0);
+  }
+
+  void reduce_const_div() {
+    for (Block& block : blocks_) {
+      std::vector<Inst> rebuilt;
+      for (const Inst& inst : block.insts) {
+        int32_t divisor = 0;
+        if (inst.dead || inst.op != Op::Div || !get_const(inst.b, divisor) || divisor == 0) {
+          rebuilt.push_back(inst);
+          continue;
+        }
+        append_signed_quot(rebuilt, inst.a, divisor, inst.dst);
+      }
+      block.insts = std::move(rebuilt);
+    }
+  }
+
+  // 没有配对除法的常数余数：先算向零商，再 x - q * d。±2^k 留给后面的与运算。
+  void reduce_const_rem() {
+    for (Block& block : blocks_) {
+      std::vector<Inst> rebuilt;
+      for (const Inst& inst : block.insts) {
+        int32_t divisor = 0;
+        if (inst.dead || inst.op != Op::Rem || !get_const(inst.b, divisor) || divisor == 0) {
+          rebuilt.push_back(inst);
+          continue;
+        }
+        if (divisor == 1 || divisor == -1) {
+          append_inst(rebuilt, Op::Li, inst.dst, -1, -1, 0);
+          continue;
+        }
+        bool pow2 = false;
+        if (divisor != INT32_MIN) {
+          const int32_t mag = divisor < 0 ? -divisor : divisor;
+          pow2 = mag >= 2 && (mag & (mag - 1)) == 0;
+        }
+        if (pow2) {
+          rebuilt.push_back(inst);
+          continue;
+        }
+        const int quot = new_vreg();
+        append_signed_quot(rebuilt, inst.a, divisor, quot);
+        const int prod = new_vreg();
+        append_inst(rebuilt, Op::Mul, prod, quot, inst.b, 0);
+        append_inst(rebuilt, Op::Sub, inst.dst, inst.a, prod, 0);
+      }
+      block.insts = std::move(rebuilt);
+    }
+  }
+
+  // i 从非负常数出发，只有在 i < bound 时才执行 i = i + 1。
+  // bound 最大是 INT_MAX，所以这次加 1 不会回绕，phi 的两个入口都非负。
+  bool nonnegative_unit_iv(const Phi& phi) {
+    if (phi.dead || phi.incoming.size() != 2) {
+      return false;
+    }
+    const int phi_dst = resolve(phi.dst);
+    int step_v = -1;
+    int latch = -1;
+    bool init_ok = false;
+    for (const auto& incoming : phi.incoming) {
+      int32_t constant = 0;
+      if (get_const(incoming.second, constant)) {
+        if (constant < 0) {
+          return false;
+        }
+        init_ok = true;
+        continue;
+      }
+      const Inst* def = def_inst(incoming.second);
+      if (def == nullptr || step_v >= 0) {
+        return false;
+      }
+      int32_t added = 0;
+      const bool addi = def->op == Op::Addi && resolve(def->a) == phi_dst && def->imm == 1;
+      const bool add = def->op == Op::Add &&
+                       ((resolve(def->a) == phi_dst && get_const(def->b, added) && added == 1) ||
+                        (resolve(def->b) == phi_dst && get_const(def->a, added) && added == 1));
+      if (!addi && !add) {
+        return false;
+      }
+      step_v = resolve(incoming.second);
+      latch = incoming.first;
+    }
+    if (!init_ok || step_v < 0 || latch < 0) {
+      return false;
+    }
+    int step_block = -1;
+    for (int block = 0; block < static_cast<int>(blocks_.size()) && step_block < 0; ++block) {
+      for (const Inst& inst : blocks_[static_cast<std::size_t>(block)].insts) {
+        if (!inst.dead && resolve(inst.dst) == step_v) {
+          step_block = block;
+          break;
+        }
+      }
+    }
+    if (step_block < 0) {
+      return false;
+    }
+    for (int block = 0; block < static_cast<int>(blocks_.size()); ++block) {
+      Inst* term = terminator(block);
+      if (term == nullptr || term->op != Op::Br || term->true_bb < 0 ||
+          term->true_bb >= static_cast<int>(blocks_.size())) {
+        continue;
+      }
+      const Inst* cond = def_inst(term->a);
+      if (cond == nullptr) {
+        continue;
+      }
+      const bool less = (cond->op == Op::Slt && resolve(cond->a) == phi_dst) ||
+                        (cond->op == Op::Sgt && resolve(cond->b) == phi_dst);
+      if (!less) {
+        continue;
+      }
+      const int taken = term->true_bb;
+      const std::vector<int>& preds = blocks_[static_cast<std::size_t>(taken)].preds;
+      if (preds.size() != 1 || preds[0] != block) {
+        continue;
+      }
+      if (dominates(taken, step_block) && dominates(taken, latch)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool proven_nonneg(int vreg, std::vector<int8_t>& memo) {
+    vreg = resolve(vreg);
+    if (vreg < 0 || vreg >= static_cast<int>(memo.size())) {
+      return false;
+    }
+    if (memo[static_cast<std::size_t>(vreg)] == 2) {
+      return true;
+    }
+    if (memo[static_cast<std::size_t>(vreg)] != 0) {
+      return false;
+    }
+    memo[static_cast<std::size_t>(vreg)] = 1;
+    bool yes = false;
+    bool saw_phi = false;
+    for (const Phi& phi : phis_) {
+      if (phi.dead || resolve(phi.dst) != vreg) {
+        continue;
+      }
+      saw_phi = true;
+      if (nonnegative_unit_iv(phi)) {
+        yes = true;
+      } else if (!phi.incoming.empty()) {
+        yes = true;
+        for (const auto& incoming : phi.incoming) {
+          if (!proven_nonneg(incoming.second, memo)) {
+            yes = false;
+            break;
+          }
+        }
+      }
+      break;
+    }
+    if (!saw_phi) {
+      const Inst* def = def_inst(vreg);
+      if (def != nullptr && def->op == Op::Li) {
+        yes = def->imm >= 0;
+      } else if (def != nullptr && is_cmp(def->op)) {
+        yes = true;
+      } else if (def != nullptr && def->op == Op::Mov) {
+        yes = proven_nonneg(def->a, memo);
+      } else if (def != nullptr && def->op == Op::And) {
+        int32_t mask = 0;
+        if ((get_const(def->a, mask) && mask >= 0) || (get_const(def->b, mask) && mask >= 0)) {
+          yes = true;
+        } else {
+          yes = proven_nonneg(def->a, memo) && proven_nonneg(def->b, memo);
+        }
+      }
+    }
+    memo[static_cast<std::size_t>(vreg)] = yes ? 2 : 3;
+    return yes;
+  }
+
   // x % ±2^k 按向零截断展开。负数余数的符号跟被除数，不能直接 and。
+  // 被除数已证明非负时，余数也非负，正负除数都收成 and。
   void reduce_pow2_rem() {
+    compute_dom();
+    std::vector<int8_t> nonneg(alias_.size(), 0);
     for (Block& block : blocks_) {
       std::vector<Inst> rebuilt;
       for (const Inst& inst : block.insts) {
@@ -2232,6 +2678,12 @@ class FunctionCompiler {
           made.imm = imm;
           rebuilt.push_back(made);
         };
+        if (proven_nonneg(inst.a, nonneg)) {
+          const int mask_li = new_vreg();
+          push(Op::Li, mask_li, -1, -1, mask_bits);
+          push(Op::And, inst.dst, inst.a, mask_li, 0);
+          continue;
+        }
         const int mask_li = new_vreg();
         push(Op::Li, mask_li, -1, -1, mask_bits);
         const int sign = new_vreg();
@@ -3003,6 +3455,9 @@ class FunctionCompiler {
     compute_dom();
     global_value_numbering();
     propagate_constants();
+    fuse_div_rem();
+    reduce_const_div();
+    reduce_const_rem();
     reduce_pow2_rem();
     rebuild_cfg();
     compute_dom();
@@ -3887,6 +4342,23 @@ class FunctionCompiler {
         emit_result(out, "sraiw", inst.dst, ", " + lhs + ", " + std::to_string(inst.imm));
         break;
       }
+      case Op::Mulh: {
+        // RV64 mulh is the high 64 of a 128-bit product. Two sign-extended
+        // int32 operands only put the sign there. The signed 32x32 high half
+        // is the low 64-bit product, shifted right by 32.
+        const std::string lhs = load_vreg(out, inst.a, "t0");
+        const std::string rhs = load_vreg(out, inst.b, "t1");
+        if (in_reg(inst.dst)) {
+          const std::string dst = reg_name(inst.dst);
+          out << '\t' << "mul " << dst << ", " << lhs << ", " << rhs << '\n';
+          out << '\t' << "srai " << dst << ", " << dst << ", 32\n";
+        } else {
+          out << '\t' << "mul t2, " << lhs << ", " << rhs << '\n';
+          out << '\t' << "srai t2, t2, 32\n";
+          out << '\t' << "sw t2, " << mem_off(inst.dst) << "(s0)\n";
+        }
+        break;
+      }
       case Op::Sle:
       case Op::Sge:
       case Op::Eq:
@@ -4404,7 +4876,7 @@ int FunctionCompiler::emit_call(const CallExprNode& call, bool tail) {
   }
   const auto found = funcs_.find(call.name);
   if (found != funcs_.end() && inline_depth_ < 4 && inline_stack_.count(call.name) == 0 &&
-      found->second->body && stmt_nodes(*found->second->body) <= 160) {
+      found->second->body && useful_nodes(*found->second->body) <= 160) {
     return emit_inline(*found->second, call);
   }
   std::vector<int> args;
