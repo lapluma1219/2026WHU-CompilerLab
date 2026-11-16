@@ -419,6 +419,57 @@ int main() {
 EOF
 run_case closedneg "$tmp/closedneg.c" /dev/null "7" 0
 
+# 累加 i 本身时收成等差求和。0 次、负数上界不进循环。65537 用来锁住「先除 2 再乘」的低 32 位。
+cat > "$tmp/series.c" << 'EOF'
+int main() {
+    int n = getint();
+    int i = 0;
+    int s = 0;
+    while (i < n) {
+        int d = i * i;
+        s = s + i;
+        i = i + 1;
+    }
+    putint(s);
+    return i;
+}
+EOF
+printf '5\n' > "$tmp/series5.in"
+run_case series5 "$tmp/series.c" "$tmp/series5.in" "10" 5
+printf '0\n' > "$tmp/series0.in"
+run_case series0 "$tmp/series.c" "$tmp/series0.in" "0" 0
+printf '65537\n' > "$tmp/seriesw.in"
+run_case seriesw "$tmp/series.c" "$tmp/seriesw.in" "-2147450880" 1
+cat > "$tmp/seriesneg.c" << 'EOF'
+int main() {
+    int n = -3;
+    int i = 0;
+    int s = 7;
+    while (i < n) {
+        s = s + i;
+        i = i + 1;
+    }
+    putint(s);
+    return i;
+}
+EOF
+run_case seriesneg "$tmp/seriesneg.c" /dev/null "7" 0
+# i*i 不是一次式，必须留在循环里，结果仍是 0+1+4+9+16。
+cat > "$tmp/square.c" << 'EOF'
+int main() {
+    int n = 5;
+    int i = 0;
+    int s = 0;
+    while (i < n) {
+        s = s + i * i;
+        i = i + 1;
+    }
+    putint(s);
+    return i;
+}
+EOF
+run_case square "$tmp/square.c" /dev/null "30" 5
+
 rm -rf "$tmp"
 if ! python3 tests/fuzz_opt.py ./compiler 11 30; then
   echo "FAIL opt-fuzz"

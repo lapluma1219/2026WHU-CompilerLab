@@ -1358,8 +1358,9 @@ class FunctionCompiler {
     return false;
   }
 
-  // 把 i = i0; while (i < bound) { acc = acc + c; i = i + 1; } 收成乘加。
-  // 只处理步长为 1、初值是非负常数、循环体没有调用/break、而且中间加法不溢出 int32 行程的情况。
+  // 把 i = i0; while (i < bound) { acc = acc + (A * i + B); i = i + 1; } 收成乘加。
+  // 步长为 1，i0 是非负常数。A、B 是循环不变量。求和按 32 位回绕：
+  // trip*(trip-1)/2 用「偶数的那个因子先除 2」再做 32 位乘法，避免先乘后除丢掉高位。
   void close_counted_loops() {
     // 一次只收一个循环，收完重建支配，避免后面的循环用到过期的前驱。
     for (;;) {
@@ -1416,14 +1417,23 @@ class FunctionCompiler {
       int iv_phi = -1;
       int32_t iv_init = 0;
       bool iv_ok = false;
-      struct Acc {
+      struct Term {
+        int32_t imm = 0;
+        std::vector<std::pair<int32_t, int>> vars;
+      };
+      struct Series {
         int phi = -1;
         int init = -1;
-        int extra = -1;
-        int32_t imm = 0;
-        bool imm_only = false;
+        Term coeff;
+        Term add;
       };
-      std::vector<Acc> accs;
+      struct PhiInfo {
+        int dst = -1;
+        int init_v = -1;
+        int next_v = -1;
+        const Inst* update = nullptr;
+      };
+      std::vector<PhiInfo> infos;
       bool shape_ok = true;
       for (int phi_index : blocks_[static_cast<std::size_t>(header)].phis) {
         Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
@@ -1434,72 +1444,269 @@ class FunctionCompiler {
           shape_ok = false;
           break;
         }
-        int init_v = -1;
-        int next_v = -1;
+        PhiInfo info;
+        info.dst = resolve(phi.dst);
         for (const auto& incoming : phi.incoming) {
           if (incoming.first == latch) {
-            next_v = resolve(incoming.second);
+            info.next_v = resolve(incoming.second);
           } else if (incoming.first == preheader) {
-            init_v = resolve(incoming.second);
+            info.init_v = resolve(incoming.second);
           }
         }
-        if (init_v < 0 || next_v < 0) {
+        if (info.init_v < 0 || info.next_v < 0) {
           shape_ok = false;
           break;
         }
-        const Inst* update = def_inst(next_v);
-        if (!update || update->dead) {
+        info.update = def_inst(info.next_v);
+        if (!info.update || info.update->dead) {
           shape_ok = false;
           break;
         }
-        const int phi_dst = resolve(phi.dst);
-        if (update->op == Op::Addi && resolve(update->a) == phi_dst && update->imm == 1 &&
-            resolve(compare->a) == phi_dst) {
+        if (info.update->op == Op::Addi && resolve(info.update->a) == info.dst && info.update->imm == 1 &&
+            resolve(compare->a) == info.dst) {
           int32_t init_c = 0;
-          if (!lookup_const(init_v, init_c) || init_c < 0) {
+          if (!lookup_const(info.init_v, init_c) || init_c < 0) {
             shape_ok = false;
             break;
           }
-          iv_phi = phi_dst;
+          iv_phi = info.dst;
           iv_init = init_c;
           iv_ok = true;
-          continue;
         }
-        if ((update->op == Op::Addi || update->op == Op::Add) &&
-            (resolve(update->a) == phi_dst || resolve(update->b) == phi_dst)) {
-          Acc acc;
-          acc.phi = phi_dst;
-          acc.init = init_v;
-          if (update->op == Op::Addi && resolve(update->a) == phi_dst) {
-            acc.imm_only = true;
-            acc.imm = update->imm;
-          } else if (update->op == Op::Add) {
-            const int other = resolve(update->a) == phi_dst ? resolve(update->b) : resolve(update->a);
-            int32_t other_c = 0;
-            if (lookup_const(other, other_c)) {
-              acc.imm_only = true;
-              acc.imm = other_c;
-            } else {
-              const int other_block = other >= 0 && other < static_cast<int>(def_block_.size())
-                                           ? def_block_[static_cast<std::size_t>(other)]
-                                           : header;
-              if (other_block == header || other_block == latch || dominates(header, other_block)) {
-                shape_ok = false;
-                break;
-              }
-              acc.extra = other;
-            }
-          } else {
-            shape_ok = false;
-            break;
-          }
-          accs.push_back(acc);
-          continue;
-        }
-        shape_ok = false;
-        break;
+        infos.push_back(info);
       }
       if (!shape_ok || !iv_ok) {
+        continue;
+      }
+      std::unordered_map<int, std::pair<int32_t, int32_t>> linear;
+      for (const PhiInfo& info : infos) {
+        if (info.dst == iv_phi) {
+          continue;
+        }
+        int32_t step = 0;
+        bool self_step = false;
+        if (info.update->op == Op::Addi && resolve(info.update->a) == info.dst) {
+          step = info.update->imm;
+          self_step = true;
+        } else if (info.update->op == Op::Add) {
+          const int lhs = resolve(info.update->a);
+          const int rhs = resolve(info.update->b);
+          if (lhs == info.dst && lookup_const(rhs, step)) {
+            self_step = true;
+          } else if (rhs == info.dst && lookup_const(lhs, step)) {
+            self_step = true;
+          }
+        }
+        int32_t init_c = 0;
+        if (self_step && lookup_const(info.init_v, init_c)) {
+          linear[info.dst] = {step, sub32(init_c, mul32(step, iv_init))};
+        }
+      }
+      std::unordered_set<int> expr_dst;
+      std::vector<Series> accs;
+      auto term_add = [](Term& dst, const Term& src) {
+        dst.imm = add32(dst.imm, src.imm);
+        dst.vars.insert(dst.vars.end(), src.vars.begin(), src.vars.end());
+      };
+      auto term_scale = [](Term& dst, int32_t factor) {
+        dst.imm = mul32(dst.imm, factor);
+        for (auto& var : dst.vars) {
+          var.first = mul32(var.first, factor);
+        }
+      };
+      for (const PhiInfo& info : infos) {
+        if (info.dst == iv_phi) {
+          continue;
+        }
+        struct Poly {
+          int32_t acc_imm = 0;
+          Term acc;
+          Term coeff;
+          Term add;
+          bool bad = false;
+        };
+        std::unordered_set<int> visiting;
+        auto parse = [&](auto& self, int vreg, int acc_phi, Poly& out) -> void {
+          vreg = resolve(vreg);
+          if (vreg == acc_phi) {
+            out.acc_imm = add32(out.acc_imm, 1);
+            return;
+          }
+          if (vreg == iv_phi) {
+            out.coeff.imm = add32(out.coeff.imm, 1);
+            return;
+          }
+          int32_t constant = 0;
+          if (lookup_const(vreg, constant)) {
+            out.add.imm = add32(out.add.imm, constant);
+            return;
+          }
+          const auto lin = linear.find(vreg);
+          if (lin != linear.end() && vreg != acc_phi) {
+            out.coeff.imm = add32(out.coeff.imm, lin->second.first);
+            out.add.imm = add32(out.add.imm, lin->second.second);
+            return;
+          }
+          const int home = vreg >= 0 && vreg < static_cast<int>(def_block_.size())
+                               ? def_block_[static_cast<std::size_t>(vreg)]
+                               : -1;
+          if (home != latch) {
+            if (home < 0 || home == header || dominates(header, home)) {
+              out.bad = true;
+              return;
+            }
+            out.add.vars.push_back({1, vreg});
+            return;
+          }
+          if (!visiting.insert(vreg).second) {
+            out.bad = true;
+            return;
+          }
+          const Inst* def = def_inst(vreg);
+          if (!def || def->dead) {
+            out.bad = true;
+            visiting.erase(vreg);
+            return;
+          }
+          expr_dst.insert(vreg);
+          auto finish = [&]() { visiting.erase(vreg); };
+          if (def->op == Op::Add || def->op == Op::Sub) {
+            Poly left;
+            Poly right;
+            self(self, def->a, acc_phi, left);
+            self(self, def->b, acc_phi, right);
+            if (left.bad || right.bad) {
+              out.bad = true;
+              finish();
+              return;
+            }
+            if (def->op == Op::Sub) {
+              term_scale(right.acc, -1);
+              term_scale(right.coeff, -1);
+              term_scale(right.add, -1);
+              right.acc_imm = mul32(right.acc_imm, -1);
+            }
+            out.acc_imm = add32(left.acc_imm, right.acc_imm);
+            term_add(out.acc, left.acc);
+            term_add(out.acc, right.acc);
+            term_add(out.coeff, left.coeff);
+            term_add(out.coeff, right.coeff);
+            term_add(out.add, left.add);
+            term_add(out.add, right.add);
+            finish();
+            return;
+          }
+          if (def->op == Op::Addi) {
+            self(self, def->a, acc_phi, out);
+            out.add.imm = add32(out.add.imm, def->imm);
+            finish();
+            return;
+          }
+          if (def->op == Op::Neg) {
+            self(self, def->a, acc_phi, out);
+            term_scale(out.acc, -1);
+            term_scale(out.coeff, -1);
+            term_scale(out.add, -1);
+            out.acc_imm = mul32(out.acc_imm, -1);
+            finish();
+            return;
+          }
+          if (def->op == Op::Shl) {
+            if (def->imm < 0 || def->imm > 31) {
+              out.bad = true;
+              finish();
+              return;
+            }
+            self(self, def->a, acc_phi, out);
+            const int32_t factor = static_cast<int32_t>(1u << def->imm);
+            term_scale(out.acc, factor);
+            term_scale(out.coeff, factor);
+            term_scale(out.add, factor);
+            out.acc_imm = mul32(out.acc_imm, factor);
+            finish();
+            return;
+          }
+          if (def->op == Op::Mov) {
+            self(self, def->a, acc_phi, out);
+            finish();
+            return;
+          }
+          if (def->op == Op::Mul) {
+            Poly left;
+            Poly right;
+            self(self, def->a, acc_phi, left);
+            self(self, def->b, acc_phi, right);
+            if (left.bad || right.bad) {
+              out.bad = true;
+              finish();
+              return;
+            }
+            auto uses_iv = [](const Poly& poly) {
+              return poly.coeff.imm != 0 || !poly.coeff.vars.empty();
+            };
+            auto uses_acc = [](const Poly& poly) {
+              return poly.acc_imm != 0 || !poly.acc.vars.empty();
+            };
+            if ((uses_iv(left) || uses_acc(left)) && (uses_iv(right) || uses_acc(right))) {
+              out.bad = true;
+              finish();
+              return;
+            }
+            Poly scaled = uses_iv(left) || uses_acc(left) ? left : right;
+            Poly factor = uses_iv(left) || uses_acc(left) ? right : left;
+            const bool factor_const = factor.acc_imm == 0 && factor.acc.vars.empty() &&
+                                       factor.coeff.imm == 0 && factor.coeff.vars.empty() &&
+                                       factor.add.vars.empty();
+            const bool factor_var = factor.acc_imm == 0 && factor.acc.vars.empty() &&
+                                     factor.coeff.imm == 0 && factor.coeff.vars.empty() &&
+                                     factor.add.imm == 0 && factor.add.vars.size() == 1 &&
+                                     factor.add.vars[0].first == 1;
+            if (factor_const) {
+              term_scale(scaled.acc, factor.add.imm);
+              term_scale(scaled.coeff, factor.add.imm);
+              term_scale(scaled.add, factor.add.imm);
+              scaled.acc_imm = mul32(scaled.acc_imm, factor.add.imm);
+            } else if (factor_var && scaled.acc.vars.empty() && scaled.coeff.vars.empty() &&
+                       scaled.add.vars.empty()) {
+              const int var = factor.add.vars[0].second;
+              if (scaled.acc_imm != 0) {
+                scaled.acc.vars.push_back({scaled.acc_imm, var});
+                scaled.acc_imm = 0;
+              }
+              if (scaled.coeff.imm != 0) {
+                scaled.coeff.vars.push_back({scaled.coeff.imm, var});
+                scaled.coeff.imm = 0;
+              }
+              if (scaled.add.imm != 0) {
+                scaled.add.vars.push_back({scaled.add.imm, var});
+                scaled.add.imm = 0;
+              }
+            } else {
+              out.bad = true;
+              finish();
+              return;
+            }
+            out = scaled;
+            finish();
+            return;
+          }
+          out.bad = true;
+          finish();
+        };
+        Poly parsed;
+        parse(parse, info.next_v, info.dst, parsed);
+        if (parsed.bad || parsed.acc_imm != 1 || !parsed.acc.vars.empty()) {
+          shape_ok = false;
+          break;
+        }
+        Series series;
+        series.phi = info.dst;
+        series.init = info.init_v;
+        series.coeff = parsed.coeff;
+        series.add = parsed.add;
+        accs.push_back(std::move(series));
+      }
+      if (!shape_ok) {
         continue;
       }
       bool extra_inst = false;
@@ -1507,7 +1714,7 @@ class FunctionCompiler {
         if (inst.dead || is_term(inst.op)) {
           continue;
         }
-        bool explained = false;
+        bool explained = expr_dst.count(resolve(inst.dst)) != 0;
         for (int phi_index : blocks_[static_cast<std::size_t>(header)].phis) {
           const Phi& phi = phis_[static_cast<std::size_t>(phi_index)];
           if (phi.dead) {
@@ -1543,7 +1750,7 @@ class FunctionCompiler {
       // 指令用必须在循环头支配的块里；phi 用必须来自头本身或头支配的前驱。
       std::unordered_set<int> exported;
       exported.insert(iv_phi);
-      for (const Acc& acc : accs) {
+      for (const Series& acc : accs) {
         exported.insert(acc.phi);
       }
       auto defined_in_loop = [&](int vreg) {
@@ -1639,36 +1846,96 @@ class FunctionCompiler {
       iv_add.b = trip;
       emit_in(enter, iv_add);
       finals.back().second = iv_final;
-      for (const Acc& acc : accs) {
-        const int prod = new_vreg();
-        if (acc.imm_only) {
-          Inst scale;
-          scale.op = Op::Li;
-          scale.dst = new_vreg();
-          scale.imm = acc.imm;
-          emit_in(enter, scale);
-          Inst mul;
-          mul.op = Op::Mul;
-          mul.dst = prod;
-          mul.a = trip;
-          mul.b = scale.dst;
-          emit_in(enter, mul);
-        } else {
-          Inst mul;
-          mul.op = Op::Mul;
-          mul.dst = prod;
-          mul.a = trip;
-          mul.b = acc.extra;
-          emit_in(enter, mul);
+      auto emit_term = [&](const Term& term) {
+        Inst base;
+        base.op = Op::Li;
+        base.dst = new_vreg();
+        base.imm = term.imm;
+        emit_in(enter, base);
+        int cur = base.dst;
+        for (const auto& var : term.vars) {
+          int piece = var.second;
+          if (var.first != 1) {
+            Inst scale;
+            scale.op = Op::Li;
+            scale.dst = new_vreg();
+            scale.imm = var.first;
+            emit_in(enter, scale);
+            Inst mul;
+            mul.op = Op::Mul;
+            mul.dst = new_vreg();
+            mul.a = scale.dst;
+            mul.b = var.second;
+            emit_in(enter, mul);
+            piece = mul.dst;
+          }
+          Inst add;
+          add.op = Op::Add;
+          add.dst = new_vreg();
+          add.a = cur;
+          add.b = piece;
+          emit_in(enter, add);
+          cur = add.dst;
         }
-        const int sum = new_vreg();
-        Inst add;
-        add.op = Op::Add;
-        add.dst = sum;
-        add.a = acc.init;
-        add.b = prod;
-        emit_in(enter, add);
-        finals.push_back({acc.phi, sum});
+        return cur;
+      };
+      auto emit_binop = [&](Op op, int lhs, int rhs) {
+        Inst inst;
+        inst.op = op;
+        inst.dst = new_vreg();
+        inst.a = lhs;
+        inst.b = rhs;
+        emit_in(enter, inst);
+        return inst.dst;
+      };
+      // trip >= 1。偶数因子先除 2，32 位乘积等于数学值的低 32 位。
+      const int two = new_vreg();
+      Inst two_li;
+      two_li.op = Op::Li;
+      two_li.dst = two;
+      two_li.imm = 2;
+      emit_in(enter, two_li);
+      Inst trip_m1_inst;
+      trip_m1_inst.op = Op::Addi;
+      trip_m1_inst.dst = new_vreg();
+      trip_m1_inst.a = trip;
+      trip_m1_inst.imm = -1;
+      emit_in(enter, trip_m1_inst);
+      const int trip_m1 = trip_m1_inst.dst;
+      const int q = emit_binop(Op::Div, trip, two);
+      const int q2 = emit_binop(Op::Div, trip_m1, two);
+      const int prod_even = emit_binop(Op::Mul, q, trip_m1);
+      const int prod_odd = emit_binop(Op::Mul, trip, q2);
+      const int twice_q = emit_binop(Op::Mul, q, two);
+      const int rem = emit_binop(Op::Sub, trip, twice_q);
+      const int delta = emit_binop(Op::Sub, prod_odd, prod_even);
+      const int rem_delta = emit_binop(Op::Mul, rem, delta);
+      const int half = emit_binop(Op::Add, prod_even, rem_delta);
+      int sum_i = half;
+      if (iv_init != 0) {
+        Inst init_scale;
+        init_scale.op = Op::Li;
+        init_scale.dst = new_vreg();
+        init_scale.imm = iv_init;
+        emit_in(enter, init_scale);
+        const int base = emit_binop(Op::Mul, trip, init_scale.dst);
+        sum_i = emit_binop(Op::Add, base, half);
+      }
+      for (const Series& acc : accs) {
+        const bool coeff_zero = acc.coeff.imm == 0 && acc.coeff.vars.empty();
+        const bool add_zero = acc.add.imm == 0 && acc.add.vars.empty();
+        int combined = acc.init;
+        if (!coeff_zero) {
+          const int aval = emit_term(acc.coeff);
+          const int part = emit_binop(Op::Mul, aval, sum_i);
+          combined = emit_binop(Op::Add, combined, part);
+        }
+        if (!add_zero) {
+          const int bval = emit_term(acc.add);
+          const int part = emit_binop(Op::Mul, bval, trip);
+          combined = emit_binop(Op::Add, combined, part);
+        }
+        finals.push_back({acc.phi, combined});
       }
       Inst jmp_join;
       jmp_join.op = Op::Jmp;
@@ -1676,7 +1943,7 @@ class FunctionCompiler {
       emit_in(enter, jmp_join);
       std::vector<std::pair<int, int>> skip_vals;
       skip_vals.push_back({iv_phi, init_li});
-      for (const Acc& acc : accs) {
+      for (const Series& acc : accs) {
         skip_vals.push_back({acc.phi, acc.init});
       }
       Inst jmp_skip;
