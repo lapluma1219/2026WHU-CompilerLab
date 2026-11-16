@@ -21,7 +21,7 @@
 make test
 ```
 
-阶段 2 第一次平台结果是 92/100，`s04_unclosed_block` 和 `s05_while_without_condition` 为错误输出。修正错误恢复后重新执行 `make test`。词法夹具、示例一、示例二和原有语义夹具仍通过；新增未闭合块（有无末尾换行、嵌套、内层先闭合）和 `while` 缺条件（空括号、缺括号、缺右括号、后面还有别的错误）。具体行号规则见 `docs/stage2.md`。本次 `make test` 结果：`92 passed, 0 failed`。CMake 重新构建成功，`build/compiler -ast` 对末尾有换行的未闭合 `main` 输出 `2 Lack of '}'`。
+阶段 2 第一次平台结果是 92/100，`s04_unclosed_block` 和 `s05_while_without_condition` 为错误输出。修正错误恢复后重新执行 `make test`。词法夹具、示例一、示例二和原有语义夹具仍通过；新增未闭合块（有无末尾换行、嵌套、内层先闭合）和 `while` 缺条件（空括号、缺括号、缺右括号、后面还有别的错误）。具体行号规则见 `docs/stage2.md`。`s04_unclosed_block` 已在平台通过。本轮针对仍失败的 `s05_while_without_condition` 增加了 `while ()` 贴着块结束、括号内分号或星号、换行后的右括号、以及 `while a = 1;` 的回归。本次 `make test`：`101 passed, 0 failed`。CMake 重新构建成功，`while()` 和 `while (;){return 0;}` 都只输出一行 `0 Lack of expression`。
 
 阶段 1 数字修正当时的 `make test` 是 `36 passed, 0 failed`。其中 32 个是 `tests/cases/*.in` 的 stdout 字节比较，另外 4 项是：
 

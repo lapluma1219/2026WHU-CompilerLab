@@ -229,7 +229,8 @@ std::unique_ptr<Stmt> Parser::parse_if() {
   stmt->line = error_line();
   stmt->column = error_column();
   ++pos_;
-  stmt->cond = parse_paren_condition();
+  bool missing_condition = false;
+  stmt->cond = parse_paren_condition(missing_condition);
   stmt->then_stmt = parse_stmt();
   if (match(TokenKind::KwElse)) {
     stmt->else_stmt = parse_stmt();
@@ -242,8 +243,17 @@ std::unique_ptr<Stmt> Parser::parse_while() {
   stmt->line = error_line();
   stmt->column = error_column();
   ++pos_;
-  stmt->cond = parse_paren_condition();
-  stmt->body = parse_stmt();
+  bool missing_condition = false;
+  stmt->cond = parse_paren_condition(missing_condition);
+  // 条件已经缺失时，紧接着的 } 或文件结束不是另一条“缺少语句”。
+  if (missing_condition && (eof() || check(TokenKind::RBrace))) {
+    auto empty = std::make_unique<EmptyStmt>();
+    empty->line = stmt->line;
+    empty->column = stmt->column;
+    stmt->body = std::move(empty);
+  } else {
+    stmt->body = parse_stmt();
+  }
   return stmt;
 }
 
@@ -252,31 +262,72 @@ bool Parser::can_start_expr() const {
          check(TokenKind::Plus) || check(TokenKind::Minus) || check(TokenKind::Not);
 }
 
-std::unique_ptr<Expr> Parser::parse_paren_condition() {
-  auto bad = [&]() {
+bool Parser::is_stmt_boundary() const {
+  return eof() || check(TokenKind::LBrace) || check(TokenKind::Semi) || check(TokenKind::RBrace) ||
+         check(TokenKind::KwIf) || check(TokenKind::KwWhile) || check(TokenKind::KwReturn) ||
+         check(TokenKind::KwBreak) || check(TokenKind::KwContinue) || check(TokenKind::KwElse);
+}
+
+void Parser::sync_open_paren_to_rparen() {
+  if (check(TokenKind::RParen)) {
+    ++pos_;
+    return;
+  }
+  // '{' 和语句关键字留给循环体。分号在尚未闭合的 '(' 里面是条件里的杂符，要跳过。
+  if (check(TokenKind::LBrace) || check(TokenKind::RBrace) || check(TokenKind::KwIf) ||
+      check(TokenKind::KwWhile) || check(TokenKind::KwReturn) || check(TokenKind::KwBreak) ||
+      check(TokenKind::KwContinue) || check(TokenKind::KwElse) || eof()) {
+    return;
+  }
+  while (!eof() && !check(TokenKind::RParen) && !check(TokenKind::LBrace) &&
+         !check(TokenKind::RBrace) && !check(TokenKind::KwIf) && !check(TokenKind::KwWhile) &&
+         !check(TokenKind::KwReturn) && !check(TokenKind::KwBreak) &&
+         !check(TokenKind::KwContinue) && !check(TokenKind::KwElse)) {
+    ++pos_;
+  }
+  if (check(TokenKind::RParen)) {
+    ++pos_;
+  }
+}
+
+std::unique_ptr<Expr> Parser::parse_paren_condition(bool& missing_condition) {
+  missing_condition = false;
+  auto bad_at = [&]() {
     auto expr = std::make_unique<BadExpr>();
     expr->line = error_line();
     expr->column = error_column();
     return expr;
   };
   if (!check(TokenKind::LParen)) {
+    missing_condition = true;
     error_here("Lack of '('");
     if (!can_start_expr()) {
-      return bad();
+      return bad_at();
     }
+    // 只有表达式后面紧跟着 ')'，才是示例二那种“缺左括号但条件和右括号都在”。
+    // 否则不把后面的语句拆开当条件，例如 while a = 1;
+    const std::size_t saved_pos = pos_;
+    const std::size_t saved_errors = errors_.size();
     auto expr = parse_expr();
     if (check(TokenKind::RParen)) {
       ++pos_;
+      missing_condition = false;
+      return expr;
     }
-    return expr;
+    if (is_stmt_boundary() && errors_.size() == saved_errors) {
+      missing_condition = false;
+      return expr;
+    }
+    pos_ = saved_pos;
+    errors_.resize(saved_errors);
+    return bad_at();
   }
   ++pos_;
   if (!can_start_expr()) {
+    missing_condition = true;
     error_here("Lack of expression");
-    if (check(TokenKind::RParen)) {
-      ++pos_;
-    }
-    return bad();
+    sync_open_paren_to_rparen();
+    return bad_at();
   }
   auto expr = parse_expr();
   if (check(TokenKind::RParen)) {

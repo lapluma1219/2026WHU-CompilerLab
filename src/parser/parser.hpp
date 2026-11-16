@@ -41,8 +41,10 @@ class Parser {
   std::unique_ptr<Stmt> parse_stmt();
   std::unique_ptr<Stmt> parse_if();
   std::unique_ptr<Stmt> parse_while();
-  std::unique_ptr<Expr> parse_paren_condition();
+  std::unique_ptr<Expr> parse_paren_condition(bool& missing_condition);
   bool can_start_expr() const;
+  bool is_stmt_boundary() const;
+  void sync_open_paren_to_rparen();
   std::unique_ptr<Stmt> parse_return();
   std::unique_ptr<Stmt> parse_var_decl(bool is_const);
   std::unique_ptr<Stmt> parse_assign_or_expr();
